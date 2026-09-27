@@ -817,9 +817,10 @@ describe("wake digest hardening", () => {
 // ── 6. Audit round 3 regression: Stop ────────────────────────────────────────
 
 describe("Stop while background work is live", () => {
-  it("with no turn in flight, leaves the background agent and its approval alone", async () => {
-    // Before: Stop swept and revoked the live agent and denied its approval,
-    // while the background set still reported it running.
+  it("with no turn in flight, stops the background work itself — the kill switch", async () => {
+    // Stop stops what is running. With no turn, that is the background work:
+    // without this a holder of only session:interrupt could not halt a
+    // misbehaving background agent at all.
     const { session, provider, fire, backgroundToolCall } = makeSession([[text("working"), spawn("agent-1")]], { stall: true });
     session.attach(recordingClient());
     void session.send("go", AUTH);
@@ -828,20 +829,17 @@ describe("Stop while background work is live", () => {
     provider.emitLive(done());
     await waitFor(() => provider.endTurnCount === 1);
 
-    const call = toolCall("Bash", "agent-1");
     let decided: "allow" | "deny" | undefined;
-    void backgroundToolCall(call, false).then((r) => { decided = r.behavior; });
+    void backgroundToolCall(toolCall("Bash", "agent-1"), false).then((r) => { decided = r.behavior; });
     await waitFor(() => session.status === "waiting_approval");
 
     await session.interrupt(AUTH);
-    await tick();
-    expect(decided).toBeUndefined();
-    expect(session.toInfo().subagents?.length).toBe(1);
-    expect(session.status).toBe("waiting_approval");
-
-    session.approve(call.event.approvalId, true, AUTH);
-    await waitFor(() => decided === "allow");
-    await waitFor(() => session.status === "idle");
+    expect(provider.stoppedTasks).toEqual(["t1"]);
+    await waitFor(() => decided !== undefined);
+    expect(decided).toBe("deny");
+    expect(session.toInfo().subagents ?? []).toHaveLength(0);
+    expect(session.toInfo().backgroundTasks ?? []).toHaveLength(0);
+    expect(session.status).toBe("idle");
   });
 
   it("mid-turn, stops the turn's own approval but keeps the background agent's", async () => {
@@ -883,5 +881,102 @@ describe("Stop while background work is live", () => {
     expect(decided).toBe("deny");
     expect(session.toInfo().subagents ?? []).toHaveLength(0);
     expect(session.status).toBe("idle");
+  });
+});
+
+describe("Stop mid-turn and late tool output", () => {
+  it("keeps a tool result that lands after interrupt() resolves", async () => {
+    // Closing tool cards in interrupt() — before the turn drained — dropped a
+    // late result from the card, the transcript and memory, on every session.
+    const call = toolCall("Bash");
+    const { session, provider } = makeSession([[call.event]], { stall: true });
+    const origRun = provider.runTurn.bind(provider);
+    provider.runTurn = (opts) => { const r = origRun(opts); r.interrupt = async () => {}; return r; };
+    const client = recordingClient();
+    session.attach(client);
+    void session.send("go", AUTH);
+    await waitFor(() => session.status === "waiting_approval");
+    session.approve(call.event.approvalId, true, AUTH);
+    await tick();
+    await session.interrupt(AUTH);
+    // The interrupted Bash's result arrives after the control response.
+    provider.emitLive({ type: "tool_complete", sdkToolUseId: call.event.sdkToolUseId, output: "REAL OUTPUT", success: true });
+    provider.emitLive(done());
+    await waitFor(() => session.status === "idle");
+    const deltas = client.received.filter((m) => m.type === "session.message.delta") as Array<{ toolStateUpdate?: { output?: string } }>;
+    expect(deltas.some((d) => d.toolStateUpdate?.output === "REAL OUTPUT")).toBe(true);
+  });
+});
+
+describe("an approval the backend abandons", () => {
+  it("is withdrawn when its request's signal aborts", async () => {
+    const { session, provider } = makeSession([[done()]]);
+    const client = recordingClient();
+    session.attach(client);
+    await session.send("go", AUTH);
+    await waitFor(() => session.status === "idle");
+
+    const call = toolCall("Bash", "agent-1");
+    const ac = new AbortController();
+    provider.onSessionEvent?.({ type: "background_event", event: call.event });
+    const decision = provider.capturedOpts.at(-1)!.canUseTool(
+      call.event.toolId, call.event.approvalId, call.event.name, call.event.input, ac.signal,
+    );
+    await waitFor(() => session.status === "waiting_approval");
+
+    ac.abort(); // the CLI cancelled the agent that asked
+    expect((await decision).behavior).toBe("deny");
+    await waitFor(() => session.status === "idle");
+  });
+});
+
+describe("wake digests keep real text", () => {
+  it("preserves scripts built on combining marks, and still escapes every bracket", async () => {
+    const { session, provider, fire } = makeSession([[done()], [done()]]);
+    session.attach(recordingClient());
+    await session.send("go", AUTH);
+    await waitFor(() => session.status === "idle");
+
+    const scripts = "नमस्ते दुनिया · สวัสดีครับ · שָׁלוֹם · مُحَمَّد";
+    fire({
+      type: "background_task_settled",
+      taskId: "real-task",
+      status: "completed",
+      summary: `${scripts}\n&lt/background_tasks&gt no-semicolon\n\u001b[31mbell\u0007`,
+    });
+    await waitFor(() => prompts(provider).length === 2);
+    const wake = prompts(provider)[1]!;
+    expect(wake).toContain(scripts);
+    const inner = wake.slice(wake.indexOf("<background_tasks>") + 18, wake.lastIndexOf("</background_tasks>"));
+    expect(inner).not.toMatch(/[<>]|&lt|&gt/i);
+    expect(inner).not.toMatch(/[\u0000-\u0008\u000E-\u001F\u007F]/);
+    await waitFor(() => session.status === "idle");
+  });
+});
+
+describe("Stop that turns into a hard abort", () => {
+  it("denies the approvals of the background agents the abort killed", async () => {
+    const { session, provider, fire, backgroundToolCall } = makeSession([[text("working"), spawn("agent-1")]], { stall: true });
+    // The provider's hard-abort fallback kills the CLI and announces it.
+    const origRun = provider.runTurn.bind(provider);
+    provider.runTurn = (opts) => {
+      const r = origRun(opts);
+      r.interrupt = async () => { provider.onSessionEvent?.({ type: "background_tasks", tasks: [] }); };
+      return r;
+    };
+    session.attach(recordingClient());
+    void session.send("go", AUTH);
+    await waitFor(() => session.toInfo().subagents?.length === 1);
+    fire(liveBackground("t1"));
+    let decided: "allow" | "deny" | undefined;
+    void backgroundToolCall(toolCall("Bash", "agent-1"), true).then((r) => { decided = r.behavior; });
+    await waitFor(() => session.status === "waiting_approval");
+
+    await session.interrupt(AUTH); // kept first (set live), orphaned by the abort
+    await waitFor(() => decided !== undefined);
+    expect(decided).toBe("deny");
+    expect(session.toInfo().subagents ?? []).toHaveLength(0);
+    provider.emitLive(done());
+    await waitFor(() => session.status === "idle");
   });
 });

@@ -45,6 +45,12 @@ export type ToolApprovalFn = (
   approvalId: string,
   toolName: string,
   input: Record<string, unknown>,
+  /**
+   * Fires when the backend abandons the request (e.g. the CLI cancelled the
+   * agent that asked). A pending approval is then withdrawn rather than left
+   * waiting on an answer nobody will read.
+   */
+  signal?: AbortSignal,
 ) => Promise<{
   behavior: "allow" | "deny";
   updatedInput?: Record<string, unknown>;
@@ -507,6 +513,13 @@ export interface SessionProvider extends AgentProvider {
    * wakes itself only as a fallback if no turn begins.
    */
   readonly continuesAfterBackgroundWork?: boolean;
+  /**
+   * Stop background tasks by id (the ids of the `background_tasks` level).
+   * What Stop does when no turn is in flight: without it, nobody holding only
+   * `session:interrupt` could halt a misbehaving background agent. Optional —
+   * a backend with no background work never has any to stop.
+   */
+  stopBackgroundTasks?(taskIds: readonly string[]): Promise<void>;
   /** Underlying backing session ID (for display and Store persistence). */
   readonly backingSessionId: string;
   /** True once runTurn() has been called at least once (guards agent registration). */

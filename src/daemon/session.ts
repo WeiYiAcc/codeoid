@@ -148,17 +148,23 @@ const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
  *
  * Matching the block's tag is a losing game (fullwidth solidus, combining
  * marks, missing brackets, entities…), so no angle bracket survives at all:
- * fold compatibility forms to ASCII, drop invisible/combining characters,
- * escape every `<`/`>`, and indent every continuation line — splitting on
- * every line break a model or terminal honours.
+ * decompose (folding compatibility forms like fullwidth ＜ to ASCII), escape
+ * every `<`/`>` and their entities, recompose — so scripts built on
+ * combining marks (Devanagari, Thai, Hebrew, Arabic) come back intact — then
+ * drop invisible bidi/zero-width and control characters and indent every
+ * continuation line, splitting on every line break a model or terminal
+ * honours.
  */
 function formatDigest(summary: string): string {
   const escaped = summary
-    .normalize("NFKC")
-    .replace(/[\p{Cf}\p{Mn}]/gu, "")
-    .replace(/<|&(?:lt|#0*60|#x0*3c);/gi, "‹")
-    .replace(/>|&(?:gt|#0*62|#x0*3e);/gi, "›");
-  const [first = "", ...rest] = escaped.split(/\r\n?|[\n\v\f\u0085\u2028\u2029]/);
+    .normalize("NFKD")
+    .replace(/[\u200B\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu, "")
+    .replace(/<|&(?:lt|#0*60|#x0*3c);?/gi, "‹")
+    .replace(/>|&(?:gt|#0*62|#x0*3e);?/gi, "›")
+    .normalize("NFC");
+  const [first = "", ...rest] = escaped
+    .split(/\r\n?|[\n\v\f\u0085\u2028\u2029]/)
+    .map((line) => line.replace(/[\u0000-\u0008\u000E-\u001F\u007F]/g, ""));
   return [first, ...rest.map((line) => `  ${line}`)].join("\n");
 }
 
@@ -2214,6 +2220,33 @@ export class Session {
     this.#broadcastInfoUpdate();
   }
 
+  /**
+   * The backend abandoned this request (the CLI cancelled the agent that
+   * asked): withdraw the approval instead of leaving a card nobody's answer
+   * can reach — the case a foreground sub-agent of a stopped turn hits while
+   * unrelated background work keeps the boundary from sweeping it.
+   */
+  #withdrawOnAbort(approvalId: string, signal: AbortSignal | undefined): void {
+    if (!signal) return;
+    const withdraw = () => {
+      queueMicrotask(() => {
+        const resolve = this.#pendingApprovals.get(approvalId);
+        if (!resolve) return;
+        this.#pendingApprovals.delete(approvalId);
+        resolve({ approved: false });
+        this.#dismissStaleApproval(approvalId, {
+          sub: "system",
+          scopes: [],
+          delegationDepth: 0,
+          accountId: this.accountId,
+          projectId: this.projectId,
+        });
+      });
+    };
+    if (signal.aborted) withdraw();
+    else signal.addEventListener("abort", withdraw, { once: true });
+  }
+
   /** The approval gate, dialog handler and principal a turn acts under. */
   #gateFor(sender: AuthContext): Pick<TurnOpts, "canUseTool" | "requestUserInput" | "sender"> {
     return {
@@ -2471,10 +2504,17 @@ export class Session {
     // before we even await the SDK — instant feedback.
     this.#flushActiveAssistant();
     this.#finalizeActiveThinking();
+    // What Stop stops: the turn if one is in flight — background agents
+    // outlive it — else the background work itself. Without the second, a
+    // holder of only session:interrupt had no way to halt a misbehaving
+    // background agent at all.
+    const run = this.#activeRun;
+    if (!run && this.#backgroundWorkLive()) {
+      await this.#provider.stopBackgroundTasks?.([...this.#backgroundTasks.keys()]);
+      this.#clearBackgroundTasks();
+    }
     // Unblock pending tool approvals so canUseTool awaiters don't leak — the
-    // turn's, not a live background agent's: Stop ends the turn, and a
-    // background agent outlives it (killing it is the CLI's call, reported
-    // through the background set).
+    // turn's, not a live background agent's.
     this.#denyPendingApprovals({ keepBackground: this.#backgroundWorkLive() });
     this.#earlyApprovals.clear();
     if (this.#pendingApprovals.size === 0) this.#approvalPatchKeys.clear();
@@ -2493,19 +2533,26 @@ export class Session {
     this.#persistAndBuffer(infoMsg);
     this.#broadcastRaw(infoMsg);
 
-    const run = this.#activeRun;
     if (run) {
       try {
         await run.interrupt();
       } catch {
         // fall through — the provider's own fallback is a hard abort
       }
+      // Tool cards are NOT closed here: the interrupted turn is still
+      // draining, and a result that lands after interrupt() resolves must
+      // still reach its card, the transcript and memory. The consumer's turn
+      // exit reconciles them once the stream ends.
+      //
+      // Read the set AFTER interrupting: a hard abort kills the CLI and
+      // announces it empty, so the approvals kept above are now orphaned.
+      if (!this.#backgroundWorkLive()) {
+        this.#denyPendingApprovals({ keepBackground: false });
+        this.#sweepStaleSubagents("interrupt");
+      }
+    } else {
+      this.#reconcileWork("interrupt", { keepBackground: this.#backgroundWorkLive() });
     }
-    // The turn's sub-agents are done whether or not the SDK ran their stop
-    // hooks; live background agents are not. Read the set AFTER interrupting:
-    // a hard abort kills the CLI and announces the set empty, so everything
-    // is reconciled then. Stop with no turn in flight touches only leftovers.
-    this.#reconcileWork("interrupt", { keepBackground: this.#backgroundWorkLive() });
     if (this.#status !== "error") this.#setStatus(this.#pendingApprovals.size > 0 ? "waiting_approval" : "idle");
   }
 
@@ -3806,7 +3853,7 @@ export class Session {
   }
 
   #makeCanUseToolFn(sender: AuthContext): ToolApprovalFn {
-    return async (toolId, approvalId, toolName, inputObj) => {
+    return async (toolId, approvalId, toolName, inputObj, signal) => {
       // Yield once so the tool_start event is processed by the event consumer
       // (creating the SessionMessage) before hooks run or the approval
       // decision is returned.
@@ -3912,6 +3959,7 @@ export class Session {
       // Manual approval — wait for user response. waiting_approval applies
       // with or without a turn: it is what renders the approval bar.
       this.#setStatus("waiting_approval");
+      this.#withdrawOnAbort(approvalId, signal);
       const { approved, updatedInput } = await this.#waitForApproval(approvalId);
       if (this.#turnActive()) this.#setStatus(approved ? "tool_running" : "thinking");
       else this.#settleBetweenTurns();

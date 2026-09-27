@@ -350,6 +350,21 @@ export class ClaudeProvider implements SessionProvider {
     return this.#makeTurnRun(turnQueue);
   }
 
+  /** Stop background tasks through the SDK; each emits a `stopped` settle. */
+  async stopBackgroundTasks(taskIds: readonly string[]): Promise<void> {
+    const q = this.#query;
+    if (!q) return;
+    for (const id of taskIds) {
+      try {
+        await q.stopTask(id);
+      } catch (err) {
+        console.error(
+          `[claude-provider ${this.#claudeCodeSessionId.slice(0, 8)}] stopTask ${id} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
   /** The TurnRun handle over one turn queue — shared by prompted and adopted turns. */
   #makeTurnRun(turnQueue: AsyncQueue<ProviderEvent>): TurnRun {
     return {
@@ -796,7 +811,7 @@ export class ClaudeProvider implements SessionProvider {
           // Call Session's approval gate (may block until user responds).
           const canUse = this.#currentCanUseTool;
           if (!canUse) return { behavior: "deny" as const, message: "provider not ready" };
-          const result = await canUse(toolId, approvalId, toolName, inputObj);
+          const result = await canUse(toolId, approvalId, toolName, inputObj, options?.signal);
           if (result.behavior === "allow") {
             return { behavior: "allow", updatedInput: result.updatedInput as Record<string, unknown> | undefined };
           }

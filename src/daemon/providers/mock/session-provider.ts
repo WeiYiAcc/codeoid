@@ -117,6 +117,13 @@ export class MockSessionProvider implements SessionProvider {
   /** Models a backend that runs the agent itself when background work settles. */
   continuesAfterBackgroundWork = false;
 
+  /** Task ids the session asked to stop (`stopBackgroundTasks`). */
+  readonly stoppedTasks: string[] = [];
+
+  async stopBackgroundTasks(taskIds: readonly string[]): Promise<void> {
+    this.stoppedTasks.push(...taskIds);
+  }
+
   /** Gates the session bound to self-started turns (`TurnRun.bindGate`). */
   readonly boundGates: Array<Pick<TurnOpts, "canUseTool" | "requestUserInput" | "sender">> = [];
 
