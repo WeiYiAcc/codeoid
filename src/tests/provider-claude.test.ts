@@ -1417,6 +1417,21 @@ describe("ClaudeProvider – systemPromptAppend loop rebuild (#153)", () => {
     await shutdown(provider);
   });
 
+  it("announces an empty background set when a rebuild kills the old CLI", async () => {
+    // Aborting the old loop kills its background agents, but the dead CLI
+    // never sends the empty level — the session kept treating them as live.
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    turn(provider, "sprint: alpha", "t1");
+    expect(got).toEqual([]); // first build: nothing to announce
+    turn(provider, "sprint: beta", "t2"); // rebuild
+    expect(got).toEqual([{ type: "background_tasks", tasks: [] }]);
+
+    await shutdown(provider);
+  });
+
   it("treats absent and empty appends as the same loop configuration", async () => {
     const provider = makeProvider();
     turn(provider, undefined, "t1");
@@ -1632,6 +1647,39 @@ describe("auto-approved tools still emit tool_start", () => {
       sdkToolUseId: "toolu_abc123",
       input: { scope: "all" },
     });
+  });
+
+  it("attributes a sub-agent's pre-approved call to that sub-agent", async () => {
+    // Without the agent id, a background agent's memory recall between turns
+    // read as the MAIN agent — opening a phantom "continuing" turn and getting
+    // its card cancelled at that turn's exit.
+    const provider = providerWithFleet();
+    capturedQueryOpts = null;
+    sdkMessages = [{ type: "result", subtype: "success", is_error: false, num_turns: 1, result: "ok", modelUsage: {} }];
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => { release = r; });
+
+    const events: ProviderEvent[] = [];
+    const run = provider.runTurn({
+      history: [], userMessage: "hi", workdir: ".",
+      canUseTool: async () => ({ behavior: "allow" as const }),
+    });
+    const drain = (async () => { for await (const e of run.events) events.push(e); })();
+
+    const preToolUse = await firstPreToolUseHook();
+    await preToolUse({
+      hook_event_name: "PreToolUse",
+      tool_name: "mcp__codeoid_fleet__fleet_list",
+      tool_input: {},
+      tool_use_id: "toolu_sub",
+      agent_id: "agent-bg-1",
+    });
+
+    release();
+    sdkGate = null;
+    await drain;
+
+    expect(events.find((e) => e.type === "tool_start")).toMatchObject({ sdkAgentId: "agent-bg-1" });
   });
 
   it("does NOT emit for a tool that still reaches canUseTool (no double tool_start)", async () => {

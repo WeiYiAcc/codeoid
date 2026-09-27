@@ -529,6 +529,11 @@ export class ClaudeProvider implements SessionProvider {
       this.#abortController?.abort();
       // The generation bump below orphans the old consumer; its identity-
       // guarded finally cannot clobber the new loop's slots.
+      //
+      // Aborting kills the old CLI, and its background tasks with it — but it
+      // will never send the empty level that says so. Send it here, or the
+      // session keeps treating dead background agents as live work.
+      this.onSessionEvent?.({ type: "background_tasks", tasks: [] });
     }
 
     const init = this.#init;
@@ -695,10 +700,15 @@ export class ClaudeProvider implements SessionProvider {
               // Session's own auto-approve (these are isSafeTool reads) keeps
               // them from prompting.
               if (this.#autoApprovedTools.has(input.tool_name)) {
+                // agent_id is set only when the hook fires inside a sub-agent.
+                // Without it a background agent's recall between turns reads as
+                // the MAIN agent and opens a phantom adopted turn.
+                const agentId = input.agent_id;
                 this.#emit({
                   type: "tool_start",
                   toolId: randomUUID(),
                   sdkToolUseId: input.tool_use_id,
+                  ...(agentId ? { sdkAgentId: agentId } : {}),
                   name: input.tool_name,
                   input: (input.tool_input ?? {}) as Record<string, unknown>,
                   approvalId: randomUUID(),
@@ -899,7 +909,15 @@ export class ClaudeProvider implements SessionProvider {
     const turnQueue = new AsyncQueue<ProviderEvent>();
     this.#currentTurnQueue = turnQueue;
     turnQueue.push(event);
-    onSessionEvent({ type: "turn_started", run: this.#makeTurnRun(turnQueue) });
+    const run: TurnRun = {
+      ...this.#makeTurnRun(turnQueue),
+      bindGate: (gate) => {
+        this.#currentCanUseTool = gate.canUseTool;
+        this.#currentRequestUserInput = gate.requestUserInput ?? null;
+        this.#currentSender = gate.sender ?? null;
+      },
+    };
+    onSessionEvent({ type: "turn_started", run });
     return true;
   }
 

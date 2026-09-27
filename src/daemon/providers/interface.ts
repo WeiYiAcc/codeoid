@@ -367,6 +367,13 @@ export interface TurnRun {
    * must never throw into the consumer's finally.
    */
   endTurn?(): void;
+  /**
+   * Adopted turns only (`turn_started`): bind the approval gate, dialog
+   * handler and acting principal for this turn. A turn the backend started on
+   * its own would otherwise run under the previous prompted turn's gate, and
+   * audit every auto-approval in it to a human who never asked for it.
+   */
+  bindGate?(gate: Pick<TurnOpts, "canUseTool" | "requestUserInput" | "sender">): void;
 }
 
 // ── ModelInfo ─────────────────────────────────────────────────────────────────

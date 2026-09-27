@@ -140,6 +140,18 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
 
 /**
+ * A task digest as it sits inside the wake's <background_tasks> block. The
+ * digest is sub-agent output, which tool content can steer: its continuation
+ * lines are indented so none can pose as another task's `- [status] task …`
+ * row, and the block's own tags are neutralized so it cannot close the block
+ * early and speak outside the "NOT a message from the owner" framing.
+ */
+function formatDigest(summary: string): string {
+  const [first = "", ...rest] = summary.replace(/<\/?background_tasks>/gi, "[background_tasks]").split("\n");
+  return [first, ...rest.map((line) => `  ${line}`)].join("\n");
+}
+
+/**
  * Max serialized message payload per scrollback.replay frame (#84). Kept well
  * under the server's 16 MB WS outbound backpressure limit (server.ts) so a
  * single chunk — plus the frame envelope and any concurrent traffic — never
@@ -628,6 +640,8 @@ export class Session {
   /** Pending fallback wake for a self-continuing backend (#armBackgroundWakeFallback). */
   #backgroundWakeFallback: ReturnType<typeof setTimeout> | null = null;
   #backgroundWakeFallbackMs = BACKGROUND_WAKE_FALLBACK_MS;
+  /** Set at the start of destroy(): no wake or adopted turn may start after it. */
+  #destroyed = false;
 
   #subagents = new Map<
     string,
@@ -2106,7 +2120,13 @@ export class Session {
         });
         // The level event usually removes it too, but do not depend on
         // ordering the contract leaves unspecified.
-        if (this.#backgroundTasks.delete(event.taskId)) this.#broadcastInfoUpdate();
+        if (this.#backgroundTasks.delete(event.taskId)) {
+          this.#broadcastInfoUpdate();
+          // The settle, not a level event, emptied the set — the same drain,
+          // or its cleanup (sweep, revocation) would wait for a level event
+          // the contract doesn't order after this one.
+          if (this.#backgroundTasks.size === 0 && !this.#turnActive()) this.#reconcileDrainedBackground();
+        }
         if (this.#provider.continuesAfterBackgroundWork) {
           // The backend delivers the result to the model itself — into the
           // running turn, or by starting one (turn_started). Our own wake would
@@ -2133,6 +2153,10 @@ export class Session {
    * approvals render, and its turn_done returns the session to idle.
    */
   #adoptTurn(run: TurnRun): void {
+    if (this.#destroyed) {
+      run.endTurn?.();
+      return;
+    }
     if (this.#turnActive()) {
       // Cannot happen while a turn queue is open (the provider only adopts
       // with none); if it ever does, never run two consumers.
@@ -2148,6 +2172,13 @@ export class Session {
       projectId: this.projectId,
     };
     this.#store.audit(systemAuth.sub, "session.turn_adopted", this.id);
+    // Its own gate and principal: approvals and audit in this turn belong to
+    // system:background, not to whoever prompted the previous turn.
+    run.bindGate?.({
+      canUseTool: this.#makeCanUseToolFn(systemAuth),
+      requestUserInput: (req) => this.requestUserInput(req),
+      sender: systemAuth,
+    });
     // A turn with no prompt reads as the agent talking to itself; say why.
     const note = this.#makeMessage(
       "info",
@@ -2187,9 +2218,10 @@ export class Session {
    */
   #armBackgroundWakeFallback(): void {
     if (this.#backgroundWakeFallback) return;
+    if (this.#destroyed) return;
     this.#backgroundWakeFallback = setTimeout(() => {
       this.#backgroundWakeFallback = null;
-      this.#maybeDeliverBackgroundReports();
+      this.#maybeDeliverBackgroundReports({ fallback: true });
     }, this.#backgroundWakeFallbackMs);
     this.#backgroundWakeFallback.unref?.();
   }
@@ -2264,7 +2296,12 @@ export class Session {
    * and the autonomous budget still applies. Nothing here grants authority;
    * it only supplies the information the model was waiting on.
    */
-  #maybeDeliverBackgroundReports(): void {
+  #maybeDeliverBackgroundReports(opts: { fallback?: boolean } = {}): void {
+    // A backend that continues on its own delivers results itself; only the
+    // fallback timer may wake it, or every idle flip (an approval decided, an
+    // interrupt) would inject a duplicate turn beside the backend's own.
+    if (this.#provider.continuesAfterBackgroundWork && !opts.fallback) return;
+    if (this.#destroyed) return;
     if (this.#deliveringBackgroundReports) return;
     if (this.#pendingBackgroundReports.length === 0) return;
     // Between turns only. A background agent's pending approval (status
@@ -2278,7 +2315,7 @@ export class Session {
     const body = [
       "<background_tasks>",
       "(daemon-injected background-task notifications — NOT a message from the owner)",
-      ...reports.map((r) => `- [${r.status}] task ${r.taskId.slice(0, 8)}: ${r.summary}`),
+      ...reports.map((r) => `- [${r.status}] task ${r.taskId.slice(0, 8)}: ${formatDigest(r.summary)}`),
       "</background_tasks>",
       "",
       "Background work you started earlier has finished. Continue what you deferred: report the results you promised, and decide any follow-up yourself.",
@@ -2345,15 +2382,14 @@ export class Session {
     // teardown() aborts the SDK query, so any sub-agent still in flight will
     // never get its SubagentStop hook. This is the setModel / rotate /
     // switchProvider path — the session survives, so the orphans would too.
-    this.#sweepStaleSubagents("provider teardown");
-    // Same per-process rule as the sweep, for background tasks: teardown kills
-    // the harness process, and its tasks die with it. The live LEVEL resets to
-    // empty; queued settle digests are kept — they are self-contained text and
-    // still worth delivering. Broadcast only when something actually cleared.
-    if (this.#backgroundTasks.size > 0) {
-      this.#backgroundTasks.clear();
-      this.#broadcastInfoUpdate();
-    }
+    // Same per-process rule for background tasks: teardown kills the harness
+    // process, and its tasks die with it. The live LEVEL resets to empty;
+    // queued settle digests are kept — they are self-contained text and still
+    // worth delivering. Whatever the drained consumer kept for live background
+    // work (tools, approvals, sub-agents) is now orphaned too.
+    this.#clearBackgroundTasks();
+    this.#reconcileWork("provider teardown", { keepBackground: false });
+    this.#denyPendingApprovals({ keepBackground: false });
     // The drained consumer's `finally` skips its own idle reset here: we nulled
     // #activeRun above, so its run-ownership guard (`#activeRun === run`) is
     // false. Without this, tearing a provider down mid-turn (setModel / rotate)
@@ -2505,6 +2541,7 @@ export class Session {
   }
 
   async destroy(sender: AuthContext): Promise<void> {
+    this.#destroyed = true;
     // Cancel any pending debounced status persist — a write firing after the
     // deletes below would resurrect the meta file for a destroyed session,
     // which restart resume would then pick up as a ghost.
@@ -2522,6 +2559,13 @@ export class Session {
     // Tear down the streamInput loop cleanly before wiping storage so we
     // don't leave a zombie SDK subprocess alive holding the transcript file.
     await this.#teardownProvider();
+    // Events the pump emitted while winding down could re-arm the fallback;
+    // clear it again and stop listening — this session is gone.
+    this.#provider.onSessionEvent = undefined;
+    if (this.#backgroundWakeFallback) {
+      clearTimeout(this.#backgroundWakeFallback);
+      this.#backgroundWakeFallback = null;
+    }
     for (const resolve of this.#pendingApprovals.values()) {
       resolve({ approved: false });
     }
@@ -3727,6 +3771,11 @@ export class Session {
       // (creating the SessionMessage) before hooks run or the approval
       // decision is returned.
       await Promise.resolve();
+      // Between turns the tool_start rides the background-event chain, whose
+      // handlers are async (a sub-agent's identity fence) — one microtask is
+      // not enough. Deciding first leaks the approval mapping and renders an
+      // approvable card for a call the gate already resolved.
+      if (!this.#turnActive()) await this.#backgroundEventChain;
 
       // Hook gate — the policy layer, run BEFORE the approval gate. A hook
       // block is a policy deny that never prompts the user (and never burns
@@ -3924,10 +3973,13 @@ export class Session {
    * iterator and recovers the turn), and the user can always interrupt.
    */
   #watchdogPaused(): boolean {
+    // A background agent's pending approval says nothing about THIS turn —
+    // counting it would disable the watchdog for every turn until answered.
+    const turnApprovalPending = [...this.#pendingApprovals.keys()].some((aid) => !this.#isBackgroundApproval(aid));
     return (
-      this.#status === "waiting_approval" ||
+      (this.#status === "waiting_approval" && (turnApprovalPending || this.#pendingApprovals.size === 0)) ||
       this.#status === "tool_running" ||
-      this.#pendingApprovals.size > 0 ||
+      turnApprovalPending ||
       // A provider dialog blocks the provider on a human answer — event-stream
       // silence is expected, exactly like a pending tool approval.
       this.#pendingUiRequests.size > 0
@@ -4001,24 +4053,18 @@ export class Session {
           this.#accumulator.handleEvent(event);
           this.#recordTurnFromResult(event.result);
           // Flush per-turn accumulators so the continuation turn starts clean.
-          this.#completeActiveTools();
-          // Same boundary, same reasoning: the sub-agents of the partial turn
-          // are done with it. This branch `continue`s without dispatching to
-          // #handleProviderEvent, so it is the only place that can reconcile
-          // them for an absorbed mid-turn boundary.
-          this.#sweepStaleSubagents("mid-turn boundary");
+          // Same boundary, same reasoning as turn exit: the partial turn's
+          // tools and sub-agents are done with it — except live background
+          // agents, which outlive it. This branch `continue`s without
+          // dispatching to #handleProviderEvent, so it is the only place that
+          // can reconcile them for an absorbed mid-turn boundary.
+          const keepBackground = this.#backgroundWorkLive();
+          this.#reconcileWork("mid-turn boundary", { keepBackground });
           this.#flushActiveAssistant();
           this.#finalizeActiveThinking();
           this.#chunker?.onTurnEnd();
           // Dismiss any stale approval gates from the interrupted turn.
-          if (this.#pendingApprovals.size > 0) {
-            const systemAuth: AuthContext = { sub: "system", scopes: [], delegationDepth: 0, accountId: this.accountId, projectId: this.projectId };
-            for (const [aid, resolveFn] of this.#pendingApprovals.entries()) {
-              resolveFn({ approved: false });
-              this.#dismissStaleApproval(aid, systemAuth);
-            }
-            this.#pendingApprovals.clear();
-          }
+          this.#denyPendingApprovals({ keepBackground });
           // Re-assert thinking status so the UI doesn't flash idle between turns.
           if (this.#status !== "error") this.#setStatus("thinking");
           continue;
@@ -4044,14 +4090,13 @@ export class Session {
       // approvals, and revoked its identity mid-task. The main agent's own
       // items are reconciled exactly as before; the drain of the background
       // set (or a teardown) reconciles the rest.
-      const keepBackground = this.#backgroundTasks.size > 0;
-      this.#completeActiveTools({ keepBackground });
+      const keepBackground = this.#backgroundWorkLive();
       // Sub-agent reconciliation belongs beside the tool reconciliation: this
       // finally is the one path every turn exit goes through — clean turn_done,
       // error, stall recovery, ownership loss. #completeActiveTools has always
       // existed here because provider events can be lost; sub-agents were simply
       // never added to the same backstop.
-      if (!keepBackground) this.#sweepStaleSubagents("turn exit");
+      this.#reconcileWork("turn exit", { keepBackground });
       // Tell the provider this turn's stream has no reader anymore. Without it
       // the queue stays open and unconsumed until the NEXT turn replaces it, so
       // a late event is silently buffered into a queue nobody will ever drain.
@@ -4060,15 +4105,7 @@ export class Session {
       this.#flushActiveAssistant();
       this.#finalizeActiveThinking();
       this.#chunker?.onTurnEnd();
-      if (this.#pendingApprovals.size > 0) {
-        const systemAuth: AuthContext = { sub: "system", scopes: [], delegationDepth: 0, accountId: this.accountId, projectId: this.projectId };
-        for (const [aid, resolveFn] of [...this.#pendingApprovals.entries()]) {
-          if (keepBackground && this.#isBackgroundApproval(aid)) continue;
-          resolveFn({ approved: false });
-          this.#dismissStaleApproval(aid, systemAuth);
-          this.#pendingApprovals.delete(aid);
-        }
-      }
+      this.#denyPendingApprovals({ keepBackground });
       // Guard: only clobber run state if this consumer owns the current run.
       // A recovery path may have started a replacement run before our finally
       // unwinds; clearing unconditionally would null the new run's slots.
@@ -4114,20 +4151,16 @@ export class Session {
       `[codeoid/session ${this.id}] turn stalled — no provider events for ${stallMs}ms; force-recovering`,
     );
 
-    // Stop any spinning UI and release waiters BEFORE we tear down.
-    this.#completeActiveTools();
+    // Stop any spinning UI and release waiters BEFORE we tear down. The
+    // teardown below kills the CLI and every background agent with it, so
+    // nothing is kept: the whole background set is dead.
+    this.#clearBackgroundTasks();
+    this.#reconcileWork("stall recovery", { keepBackground: false });
     this.#flushActiveAssistant();
     this.#finalizeActiveThinking();
     this.#chunker?.onTurnEnd();
     this.#pendingMidTurnCount = 0;
-    if (this.#pendingApprovals.size > 0) {
-      const systemAuth: AuthContext = { sub: "system", scopes: [], delegationDepth: 0, accountId: this.accountId, projectId: this.projectId };
-      for (const [aid, resolveFn] of this.#pendingApprovals.entries()) {
-        resolveFn({ approved: false });
-        this.#dismissStaleApproval(aid, systemAuth);
-      }
-      this.#pendingApprovals.clear();
-    }
+    this.#denyPendingApprovals({ keepBackground: false });
 
     // Drop the wedged run so a concurrent send() doesn't queue into it.
     this.#activeRun = null;
@@ -4668,17 +4701,45 @@ export class Session {
    * to the point it is actually true.
    */
   #reconcileDrainedBackground(): void {
-    this.#completeActiveTools();
-    if (this.#pendingApprovals.size > 0) {
-      const systemAuth: AuthContext = { sub: "system", scopes: [], delegationDepth: 0, accountId: this.accountId, projectId: this.projectId };
-      for (const [aid, resolveFn] of [...this.#pendingApprovals.entries()]) {
-        resolveFn({ approved: false });
-        this.#dismissStaleApproval(aid, systemAuth);
-        this.#pendingApprovals.delete(aid);
-      }
-    }
-    this.#sweepStaleSubagents("background tasks drained");
+    this.#reconcileWork("background tasks drained", { keepBackground: false });
+    this.#denyPendingApprovals({ keepBackground: false });
     this.#settleBetweenTurns();
+  }
+
+  /** The provider reports background work still running. */
+  #backgroundWorkLive(): boolean {
+    return this.#backgroundTasks.size > 0;
+  }
+
+  /** The background set died with its process (teardown, stall recovery). */
+  #clearBackgroundTasks(): void {
+    if (this.#backgroundTasks.size === 0) return;
+    this.#backgroundTasks.clear();
+    this.#broadcastInfoUpdate();
+  }
+
+  /**
+   * Reconcile in-flight tools and sub-agents at a boundary — the one rule
+   * every boundary applies (mid-turn, turn exit, stall recovery, teardown,
+   * background drain). With `keepBackground`, work that can outlive the turn
+   * (a sub-agent's, or one that arrived between turns) is left for the drain
+   * of the background set.
+   */
+  #reconcileWork(reason: string, opts: { keepBackground: boolean }): void {
+    this.#completeActiveTools({ keepBackground: opts.keepBackground });
+    if (!opts.keepBackground) this.#sweepStaleSubagents(reason);
+  }
+
+  /** Deny and dismiss pending approvals, leaving background ones when asked. */
+  #denyPendingApprovals(opts: { keepBackground: boolean }): void {
+    if (this.#pendingApprovals.size === 0) return;
+    const systemAuth: AuthContext = { sub: "system", scopes: [], delegationDepth: 0, accountId: this.accountId, projectId: this.projectId };
+    for (const [aid, resolveFn] of [...this.#pendingApprovals.entries()]) {
+      if (opts.keepBackground && this.#isBackgroundApproval(aid)) continue;
+      resolveFn({ approved: false });
+      this.#dismissStaleApproval(aid, systemAuth);
+      this.#pendingApprovals.delete(aid);
+    }
   }
 
   /** A tool call that can outlive its turn (see #backgroundToolMsgIds). */

@@ -117,6 +117,9 @@ export class MockSessionProvider implements SessionProvider {
   /** Models a backend that runs the agent itself when background work settles. */
   continuesAfterBackgroundWork = false;
 
+  /** Gates the session bound to self-started turns (`TurnRun.bindGate`). */
+  readonly boundGates: Array<Pick<TurnOpts, "canUseTool" | "requestUserInput" | "sender">> = [];
+
   /**
    * Start a turn ON THE BACKEND'S OWN, the way the Claude CLI answers a
    * finished background task: a fresh queue, handed to the session through
@@ -133,6 +136,7 @@ export class MockSessionProvider implements SessionProvider {
         queue.close();
         if (this.#currentQueue === queue) this.#currentQueue = null;
       },
+      bindGate: (gate) => { this.boundGates.push(gate); },
     };
     if (this.#midTurn) {
       run.pushMidTurn = (content: string, priority: string) => {
