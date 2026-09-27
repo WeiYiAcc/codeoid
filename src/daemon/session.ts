@@ -142,20 +142,23 @@ const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
 
 /**
  * A task digest as it sits inside the wake's <background_tasks> block. The
- * digest is sub-agent output, which tool content can steer: its continuation
- * lines are indented so none can pose as another task's `- [status] task …`
- * row, and the block's own tags are neutralized so it cannot close the block
- * early and speak outside the "NOT a message from the owner" framing.
+ * digest is sub-agent output, which tool content can steer, so it must not be
+ * able to end the block and speak outside its "NOT a message from the owner"
+ * framing, nor pose as another task's `- [status] task …` row.
+ *
+ * Matching the block's tag is a losing game (fullwidth solidus, combining
+ * marks, missing brackets, entities…), so no angle bracket survives at all:
+ * fold compatibility forms to ASCII, drop invisible/combining characters,
+ * escape every `<`/`>`, and indent every continuation line — splitting on
+ * every line break a model or terminal honours.
  */
 function formatDigest(summary: string): string {
-  const normalized = summary
-    // Every line break a model (or terminal) honours, not just \n.
-    .replace(/\r\n?|[\u0085\u2028\u2029]/g, "\n")
-    // Invisible format characters could hide a tag from the check below.
-    .replace(/\p{Cf}/gu, "")
-    // The block's tags in any spelling a model would still read as a tag.
-    .replace(/[<\uFF1C]\s*\/?\s*background_tasks[^>\uFF1E]*[>\uFF1E]/gi, "[background_tasks]");
-  const [first = "", ...rest] = normalized.split("\n");
+  const escaped = summary
+    .normalize("NFKC")
+    .replace(/[\p{Cf}\p{Mn}]/gu, "")
+    .replace(/<|&(?:lt|#0*60|#x0*3c);/gi, "‹")
+    .replace(/>|&(?:gt|#0*62|#x0*3e);/gi, "›");
+  const [first = "", ...rest] = escaped.split(/\r\n?|[\n\v\f\u0085\u2028\u2029]/);
   return [first, ...rest.map((line) => `  ${line}`)].join("\n");
 }
 
@@ -1923,8 +1926,9 @@ export class Session {
       // neither the mid-turn flush nor the consumer's finally reconciles them,
       // because the loop never exits.
       if (effectivePriority !== "later") this.#pendingMidTurnCount++;
-      // Joining a turn the backend started on its own: the owner is now
-      // steering it, so its approvals and audit are theirs from here on.
+      // Only an adopted run (a turn the backend started on its own) exposes
+      // bindGate: the owner joining it now steers it, so its approvals and
+      // audit are theirs from here on. A prompted turn is already theirs.
       this.#activeRun.bindGate?.(this.#gateFor(sender));
       this.#activeRun.pushMidTurn(effectivePrompt, effectivePriority);
       // Keep waiting_approval AND tool_running visible. Both are real states the

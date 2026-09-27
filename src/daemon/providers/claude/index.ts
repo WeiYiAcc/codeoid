@@ -366,6 +366,10 @@ export class ClaudeProvider implements SessionProvider {
         }
         this.#abortController?.abort();
         this.#inputQueue?.close();
+        // The hard abort kills the CLI and its background tasks. The loop's
+        // own finally announces that — unless a new turn rebuilds the loop
+        // first and its generation bump silences the old finally. Say it now.
+        this.onSessionEvent?.({ type: "background_tasks", tasks: [] });
       },
       pushMidTurn: (content, priority) => {
         // A "later" mid-turn injection is meant to MERGE into the running turn

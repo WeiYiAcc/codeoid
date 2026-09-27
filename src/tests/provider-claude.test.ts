@@ -31,6 +31,9 @@ let queryCallCount = 0;
 /** When set, the mock loop blocks before finishing so tests can invoke captured
  *  callbacks (canUseTool, hooks) while the turn queue is still open. */
 let sdkGate: Promise<void> | null = null;
+/** When true, the mock query's interrupt() rejects — forcing the provider's
+ *  hard-abort fallback. */
+let sdkInterruptThrows = false;
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -48,7 +51,9 @@ function makeMockQuery() {
         },
       };
     },
-    interrupt: async () => {},
+    interrupt: async () => {
+      if (sdkInterruptThrows) throw new Error("interrupt unsupported");
+    },
     supportedModels: async () => [{ value: "claude-opus-4", displayName: "Claude Opus 4" }],
   };
 }
@@ -1444,6 +1449,24 @@ describe("ClaudeProvider – systemPromptAppend loop rebuild (#153)", () => {
     await Bun.sleep(5);
     expect(got).toContainEqual({ type: "background_tasks", tasks: [] });
     await provider.teardown();
+  });
+
+  it("announces an empty background set on a hard abort, even if a new turn rebuilds first", async () => {
+    // The hard abort kills the CLI. Its loop's finally would say so, but a new
+    // turn rebuilding the loop first bumps the generation and silences it.
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+    const run = turn(provider, "sprint: alpha", "t1");
+    sdkInterruptThrows = true;
+    try {
+      await run.interrupt();
+    } finally {
+      sdkInterruptThrows = false;
+    }
+    turn(provider, "sprint: alpha", "t2"); // rebuilds before the old finally runs
+    expect(got).toContainEqual({ type: "background_tasks", tasks: [] });
+    await shutdown(provider);
   });
 
   it("treats absent and empty appends as the same loop configuration", async () => {
