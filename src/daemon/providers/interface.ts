@@ -285,13 +285,20 @@ export interface BackgroundTaskSnapshot {
  * observed live — a session promised a report, its tasks settled into a closed
  * queue, and it sat idle until the owner interrupted it.
  *
- * Two events, mirroring the level+edge design the Claude SDK itself settled on:
+ * Three events. The first two mirror the level+edge design the Claude SDK
+ * itself settled on:
  *
  * - `background_tasks` is a LEVEL: the full live set after any membership
  *   change, with REPLACE semantics. Consumers swap their state for the payload,
  *   so a missed event can never wedge a stale "running" indicator.
  * - `background_task_settled` is the EDGE that carries the outcome digest —
  *   the thing a session must be woken with.
+ * - `background_event` carries a background agent's own lifecycle — a tool
+ *   call, a tool result, a sub-agent starting or stopping — that happened with
+ *   no turn in flight. Background agents outlive the turn that spawned them,
+ *   so their tool calls (and the approvals those need) routinely land between
+ *   turns; sent to the turn queue they were dropped, the approval card never
+ *   rendered, and the session sat blocked on a prompt nobody could see.
  *
  * Provider-agnostic on purpose: claude maps its SDK notifications onto these
  * today; pi/gemini/codex emit nothing until their harnesses grow background
@@ -306,7 +313,26 @@ export type SessionScopedEvent =
       status: "completed" | "failed" | "stopped";
       /** Compressed outcome — what the session is woken with. Never a raw transcript. */
       summary: string;
-    };
+    }
+  | { type: "background_event"; event: BackgroundLifecycleEvent };
+
+/** The provider events a background agent emits on its own, between turns. */
+export type BackgroundLifecycleEvent = Extract<
+  ProviderEvent,
+  { type: "tool_start" | "tool_complete" | "subagent_start" | "subagent_stop" }
+>;
+
+/** Event types a provider reroutes to `background_event` when no turn can take them. */
+export const BACKGROUND_LIFECYCLE_EVENT_TYPES: ReadonlySet<ProviderEvent["type"]> = new Set([
+  "tool_start",
+  "tool_complete",
+  "subagent_start",
+  "subagent_stop",
+]);
+
+export function isBackgroundLifecycleEvent(e: ProviderEvent): e is BackgroundLifecycleEvent {
+  return BACKGROUND_LIFECYCLE_EVENT_TYPES.has(e.type);
+}
 
 // ── TurnRun ───────────────────────────────────────────────────────────────────
 

@@ -15,6 +15,7 @@ import {
   shortSub,
 } from "../../lib/identity";
 import { classifyFleetTool, type FleetCard } from "../../lib/fleet-cards";
+import { isBackgroundWake, parseBackgroundWake } from "@highflame/codeoid-core";
 import { safeImageUri, safeLinkUri } from "../../lib/sanitize-url";
 import {
   createFrameThrottled,
@@ -70,7 +71,7 @@ const Header: Component<{ msg: SessionMessage }> = (props) => (
     <span
       class={`font-semibold uppercase tracking-wider ${roleColor(props.msg.role)}`}
     >
-      {ROLE_LABEL[props.msg.role]}
+      {isBackgroundWake(props.msg) ? "background" : ROLE_LABEL[props.msg.role]}
     </span>
     <span
       class={`truncate font-mono text-fg-muted ${identityColorClass(props.msg.identity.type)}`}
@@ -109,6 +110,9 @@ const Body: Component<{ msg: SessionMessage; streaming?: boolean }> = (props) =>
       </Match>
       <Match when={m().role === "info"}>
         <InfoBlock msg={m()} />
+      </Match>
+      <Match when={isBackgroundWake(m())}>
+        <BackgroundWakeBlock text={m().content} />
       </Match>
       <Match when={m().role === "user" || m().role === "system"}>
         <Plain text={m().content} />
@@ -579,6 +583,47 @@ const CollapsibleOutput: Component<{
           </span>
         </button>
       </Show>
+    </div>
+  );
+};
+
+/**
+ * The daemon's background wake, as what it is: a compact "N tasks finished"
+ * notice with each task's status and headline, the full injected text one
+ * click away — not a wall of text under "you".
+ */
+const BackgroundWakeBlock: Component<{ text: string }> = (props) => {
+  const tasks = createMemo(() => parseBackgroundWake(props.text));
+  return (
+    <div class="rounded border border-border bg-bg-active/30 px-2 py-1.5 text-[12px] text-fg-muted">
+      <div class="mb-0.5 font-semibold">
+        {tasks().length === 1
+          ? "1 background task finished"
+          : `${tasks().length} background tasks finished`}
+      </div>
+      <ul class="space-y-0.5">
+        <Index each={tasks()}>
+          {(t) => (
+            <li class="flex gap-2 font-mono text-[11px]">
+              <span class={t().status === "completed" ? "text-fg-muted" : "text-danger"}>
+                {t().status}
+              </span>
+              <span class="shrink-0 text-fg-faint">{t().taskId}</span>
+              <span class="truncate" title={t().headline}>
+                {t().headline}
+              </span>
+            </li>
+          )}
+        </Index>
+      </ul>
+      <details class="mt-1">
+        <summary class="cursor-pointer select-none text-fg-faint hover:text-fg-muted">
+          full report sent to the agent
+        </summary>
+        <div class="mt-1 whitespace-pre-wrap break-words font-mono text-[11px] text-fg-muted">
+          {props.text}
+        </div>
+      </details>
     </div>
   );
 };

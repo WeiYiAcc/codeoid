@@ -8,3 +8,4 @@ export * from "./usage-days.js";
 export * from "./sanitize-url.js";
 export * from "./slash.js";
 export * from "./models.js";
+export * from "./background-wake.js";

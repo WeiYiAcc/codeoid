@@ -14,7 +14,7 @@
  */
 
 import { mock, describe, it, expect, beforeEach } from "bun:test";
-import type { ProviderEvent , SessionScopedEvent } from "../daemon/providers/interface.js";
+import type { BackgroundLifecycleEvent, ProviderEvent , SessionScopedEvent } from "../daemon/providers/interface.js";
 
 // ── SDK mock ──────────────────────────────────────────────────────────────────
 
@@ -1761,5 +1761,49 @@ describe("translateSDKMessage — background tasks", () => {
       "claude",
     );
     expect(turnEvents).toEqual([]);
+  });
+});
+
+// A background agent's lifecycle happens on the agent's schedule: its tool
+// calls and results routinely land after turn_done, with no turn queue to take
+// them. Dropped, the tool_start's approval card never rendered and the session
+// blocked on a prompt nobody could see; carried to the next turn, a
+// tool_complete stranded the status. The session channel delivers them now.
+describe("ClaudeProvider — background agent events with no turn in flight", () => {
+  const toolStart: BackgroundLifecycleEvent = {
+    type: "tool_start",
+    toolId: "t1",
+    sdkToolUseId: "u1",
+    sdkAgentId: "agent-1",
+    name: "Bash",
+    input: { command: "ls" },
+    approvalId: "a1",
+  };
+
+  it("routes tool and sub-agent lifecycle events to the session channel", () => {
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    const lifecycle: BackgroundLifecycleEvent[] = [
+      toolStart,
+      { type: "tool_complete", sdkToolUseId: "u1", output: "ok", success: true },
+      { type: "subagent_start", agentId: "agent-2", agentType: "general-purpose" },
+      { type: "subagent_stop", agentId: "agent-2" },
+    ];
+    for (const e of lifecycle) provider._emitForTest(e);
+
+    expect(got).toEqual(lifecycle.map((event) => ({ type: "background_event", event })));
+  });
+
+  it("never reroutes turn-scoped events — a stale turn_done or text would corrupt the next turn", () => {
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    provider._emitForTest({ type: "text_done", content: "late" });
+    provider._emitForTest({ type: "turn_done", result: { providerId: "claude", model: "m", inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 0 } });
+
+    expect(got).toEqual([]);
   });
 });

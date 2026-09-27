@@ -42,6 +42,7 @@ import { rewriteBashToolInput } from "../../compress/index.js";
 import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
 import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry } from "../interface.js";
+import { isBackgroundLifecycleEvent } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -824,6 +825,15 @@ export class ClaudeProvider implements SessionProvider {
     })();
   }
 
+  /**
+   * TS-private test seam: emit as the SDK translation would, so the delivery
+   * policy (turn queue → session channel → carryover) is testable without a
+   * live SDK loop. Do NOT call from production code.
+   */
+  _emitForTest(event: ProviderEvent): void {
+    this.#emit(event);
+  }
+
   /** Push a ProviderEvent to the active per-turn queue. */
   #emit(event: ProviderEvent): void {
     const queue = this.#currentTurnQueue;
@@ -857,6 +867,17 @@ export class ClaudeProvider implements SessionProvider {
    * would corrupt its transcript.
    */
   #handleUndeliverable(event: ProviderEvent, reason: string): void {
+    // A background agent's own lifecycle (a tool call, its result, a sub-agent
+    // starting or stopping) happens on the agent's schedule, not the turn's —
+    // it routinely lands after turn_done. Deliver it to the session NOW rather
+    // than dropping it (a dropped tool_start means its approval card never
+    // renders and the session blocks on a prompt nobody can see) or deferring
+    // it to the next turn (a deferred tool_complete strands the status).
+    const onSessionEvent = this.onSessionEvent;
+    if (onSessionEvent && isBackgroundLifecycleEvent(event)) {
+      onSessionEvent({ type: "background_event", event });
+      return;
+    }
     const carryable = CARRYOVER_EVENT_TYPES.has(event.type);
     if (carryable && this.#carryover.length < MAX_CARRYOVER_EVENTS) {
       this.#carryover.push(event);

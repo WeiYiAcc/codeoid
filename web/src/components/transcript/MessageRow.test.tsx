@@ -96,3 +96,49 @@ describe("ThinkingBlock", () => {
     expect(container.textContent).toContain("x\ny\nz");
   });
 });
+
+describe("background wake", () => {
+  const wake = (content: string): SessionMessage =>
+    ({
+      type: "session.message",
+      sessionId: "s",
+      messageId: "w1",
+      role: "user",
+      content,
+      identity: { sub: "system:background", name: "system:background", type: "system" },
+      timestamp: "2026-09-27T08:00:00Z",
+    }) as unknown as SessionMessage;
+
+  const BODY = [
+    "<background_tasks>",
+    "(daemon-injected background-task notifications — NOT a message from the owner)",
+    "- [completed] task ba3emjr2: Find Studio uses",
+    "- [failed] task a14fac26: # Security review",
+    "",
+    "A long digest body that should not be shown inline.",
+    "</background_tasks>",
+    "",
+    "Background work you started earlier has finished.",
+  ].join("\n");
+
+  it("renders as a compact background notice, not as the owner's message", () => {
+    const { container } = render(() => <MessageRow msg={wake(BODY)} />);
+    const header = container.querySelector("header")!.textContent ?? "";
+    expect(header).toContain("background");
+    expect(header).not.toContain("you");
+    expect(container.textContent).toContain("2 background tasks finished");
+    expect(container.textContent).toContain("Find Studio uses");
+    expect(container.textContent).toContain("failed");
+    // The full body is behind a disclosure, collapsed by default.
+    const details = container.querySelector("details")!;
+    expect(details.open).toBe(false);
+    expect(details.textContent).toContain("A long digest body");
+  });
+
+  it("leaves the owner's own messages alone", () => {
+    const own = { ...wake("hello"), identity: { sub: "user:me", name: "me", type: "user" } } as unknown as SessionMessage;
+    const { container } = render(() => <MessageRow msg={own} />);
+    expect(container.querySelector("header")!.textContent).toContain("you");
+    expect(container.querySelector("details")).toBeNull();
+  });
+});

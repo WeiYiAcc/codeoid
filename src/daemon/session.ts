@@ -608,6 +608,13 @@ export class Session {
   #reportedBackgroundTasks = new Set<string>();
   /** Re-entrancy guard: one wake injection at a time. */
   #deliveringBackgroundReports = false;
+  /**
+   * Serializes background agents' lifecycle events delivered between turns
+   * (`background_event`). The handlers are async (a tool_start awaits the
+   * sub-agent's identity fence), and a tool_complete must never overtake the
+   * tool_start it closes.
+   */
+  #backgroundEventChain: Promise<void> = Promise.resolve();
 
   #subagents = new Map<
     string,
@@ -710,6 +717,13 @@ export class Session {
   // messageId → canonical tool_call message, kept around so the completion
   // update preserves the original tool input.
   #toolCallMessages = new Map<string, SessionMessage>();
+  /**
+   * Tool calls that can outlive the turn: made by a sub-agent (the provider
+   * attributed them — no reliance on the SubagentStart hook having registered
+   * it) or arriving with no turn in flight at all. Turn exit leaves these to
+   * the background set's drain while background work is live.
+   */
+  #backgroundToolMsgIds = new Set<string>();
 
   // Live MCP state captured from the SDK's `system/init` events. The SDK
   // emits one init per query, so these are refreshed on every send(). Keyed
@@ -1900,7 +1914,10 @@ export class Session {
     // falling through to a fresh turn would close the live turn queue and
     // auto-deny the approval (see wasWorking above). Fail loudly instead —
     // the message is already persisted, the user re-sends after deciding.
-    if (this.#status === "waiting_approval") {
+    // Only with a turn in flight. With none, the pending approval belongs to a
+    // background agent: a fresh turn closes no queue, the approval survives it
+    // (turn exit keeps background approvals), and the message goes through.
+    if (this.#status === "waiting_approval" && this.#turnActive()) {
       throw new Error(
         `${this.#describePendingApprovals()} — approve or deny it before sending (this backend can't queue mid-turn). Your message was saved; send again after deciding.`,
       );
@@ -2027,8 +2044,28 @@ export class Session {
             const prev = this.#backgroundTasks.get(id);
             return !prev || prev.status !== t.status || prev.description !== t.description;
           });
+        const drained = next.size === 0 && this.#backgroundTasks.size > 0;
         this.#backgroundTasks = next;
         if (changed) this.#broadcastInfoUpdate();
+        // Turn exit keeps sub-agents alive while background work is live (they
+        // may BE that work). Once it drains, anything still registered with no
+        // turn in flight really is stale — reconcile it here instead.
+        if (drained && !this.#turnActive()) this.#reconcileDrainedBackground();
+        break;
+      }
+      case "background_event": {
+        // A background agent's tool call / result / sub-agent lifecycle with
+        // no turn to carry it. Same handler a turn uses — so the tool card and
+        // its approval bar render exactly as they would mid-turn — with the
+        // turn-only status effects gated off by #turnActive().
+        const inner = event.event;
+        this.#backgroundEventChain = this.#backgroundEventChain
+          .then(() => this.#handleProviderEvent(inner))
+          .catch((err) => {
+            console.error(
+              `[codeoid/session ${this.id.slice(0, 8)}] background ${inner.type} failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
         break;
       }
       case "background_task_settled": {
@@ -2122,7 +2159,11 @@ export class Session {
   #maybeDeliverBackgroundReports(): void {
     if (this.#deliveringBackgroundReports) return;
     if (this.#pendingBackgroundReports.length === 0) return;
-    if (this.#status !== "idle") return;
+    // Between turns only. A background agent's pending approval (status
+    // waiting_approval with no turn in flight) does not block the report: the
+    // wake starts a fresh turn and the approval stays pending and visible.
+    if (this.#turnActive()) return;
+    if (this.#status !== "idle" && this.#status !== "waiting_approval") return;
 
     const reports = this.#pendingBackgroundReports.splice(0);
     this.#deliveringBackgroundReports = true;
@@ -3660,14 +3701,19 @@ export class Session {
         this.#approvalIdToMessageId.delete(approvalId); // clean up — no manual approval will reference this
         this.#approvalPatchKeys.delete(approvalId);
         this.#store.audit(sender.sub, "session.auto_approve", this.id, `tool=${toolName} mode=${this.#mode}`);
-        this.#setStatus("tool_running");
+        // Turn status only. A background agent's call between turns must not
+        // move an idle session to tool_running: nothing would ever move it
+        // back, and the background wake (gated on idle) would never fire.
+        this.#setTurnStatus("tool_running");
         return { behavior: "allow" as const, updatedInput: effectiveInput };
       }
 
-      // Manual approval — wait for user response.
+      // Manual approval — wait for user response. waiting_approval applies
+      // with or without a turn: it is what renders the approval bar.
       this.#setStatus("waiting_approval");
       const { approved, updatedInput } = await this.#waitForApproval(approvalId);
-      this.#setStatus(approved ? "tool_running" : "thinking");
+      if (this.#turnActive()) this.#setStatus(approved ? "tool_running" : "thinking");
+      else this.#settleBetweenTurns();
 
       // Finalize the tool_call message in scrollback + transcript.
       // Approved → "executing" (tool hasn't run yet — tool_complete will
@@ -3879,13 +3925,21 @@ export class Session {
       this.#broadcastRaw(errorMsg);
     } finally {
       this.#pendingMidTurnCount = 0; // safety: reset on any exit path
-      this.#completeActiveTools();
+      // Background agents outlive the turn that spawned them. While the
+      // provider reports live background work, a sub-agent's in-flight tools,
+      // pending approvals and registration are that work, not leftovers —
+      // cancelling them here showed its calls as "cancelled", auto-denied its
+      // approvals, and revoked its identity mid-task. The main agent's own
+      // items are reconciled exactly as before; the drain of the background
+      // set (or a teardown) reconciles the rest.
+      const keepBackground = this.#backgroundTasks.size > 0;
+      this.#completeActiveTools({ keepBackground });
       // Sub-agent reconciliation belongs beside the tool reconciliation: this
       // finally is the one path every turn exit goes through — clean turn_done,
       // error, stall recovery, ownership loss. #completeActiveTools has always
       // existed here because provider events can be lost; sub-agents were simply
       // never added to the same backstop.
-      this.#sweepStaleSubagents("turn exit");
+      if (!keepBackground) this.#sweepStaleSubagents("turn exit");
       // Tell the provider this turn's stream has no reader anymore. Without it
       // the queue stays open and unconsumed until the NEXT turn replaces it, so
       // a late event is silently buffered into a queue nobody will ever drain.
@@ -3896,11 +3950,12 @@ export class Session {
       this.#chunker?.onTurnEnd();
       if (this.#pendingApprovals.size > 0) {
         const systemAuth: AuthContext = { sub: "system", scopes: [], delegationDepth: 0, accountId: this.accountId, projectId: this.projectId };
-        for (const [aid, resolveFn] of this.#pendingApprovals.entries()) {
+        for (const [aid, resolveFn] of [...this.#pendingApprovals.entries()]) {
+          if (keepBackground && this.#isBackgroundApproval(aid)) continue;
           resolveFn({ approved: false });
           this.#dismissStaleApproval(aid, systemAuth);
+          this.#pendingApprovals.delete(aid);
         }
-        this.#pendingApprovals.clear();
       }
       // Guard: only clobber run state if this consumer owns the current run.
       // A recovery path may have started a replacement run before our finally
@@ -3908,7 +3963,15 @@ export class Session {
       if (this.#activeRun === run) {
         this.#activeRun = null;
         this.#eventConsumerTask = null;
-        if (this.#status !== "error") this.#setStatus("idle");
+        // A background approval that outlived the turn keeps its bar up.
+        if (this.#status !== "error") {
+          this.#setStatus(this.#pendingApprovals.size > 0 ? "waiting_approval" : "idle");
+        }
+        // Reports that settled mid-turn deliver now. Explicit rather than via
+        // #setStatus: turn_done already flipped the status to idle while the
+        // run was still active, so the flip above is a no-op and would never
+        // reach the (between-turns-only) delivery gate.
+        this.#maybeDeliverBackgroundReports();
       }
     }
   }
@@ -4134,6 +4197,7 @@ export class Session {
         );
         this.#activeToolMsgIds.push(toolMsg.messageId);
         this.#toolCallMessages.set(toolMsg.messageId, toolMsg);
+        if (event.sdkAgentId || !this.#turnActive()) this.#backgroundToolMsgIds.add(toolMsg.messageId);
         this.#toolUseIdToMessageId.set(event.sdkToolUseId, toolMsg.messageId);
         this.#messageIdToToolUseId.set(toolMsg.messageId, event.sdkToolUseId);
         this.#approvalIdToMessageId.set(event.approvalId, toolMsg.messageId);
@@ -4192,13 +4256,14 @@ export class Session {
               timestamp: completedMsg.timestamp,
             });
             this.#toolCallMessages.delete(msgId);
+            this.#backgroundToolMsgIds.delete(msgId);
             this.#messageIdToToolUseId.delete(msgId);
             const idx = this.#activeToolMsgIds.indexOf(msgId);
             if (idx >= 0) this.#activeToolMsgIds.splice(idx, 1);
           }
           this.#toolUseIdToMessageId.delete(event.sdkToolUseId);
         }
-        if (this.#status === "tool_running") this.#setStatus("thinking");
+        if (this.#status === "tool_running") this.#setTurnStatus("thinking");
         break;
       }
 
@@ -4470,12 +4535,49 @@ export class Session {
   }
 
   /** Mark any still-open tool calls as cancelled — skips ones already closed with a real tool_result. */
-  #completeActiveTools(): void {
+  #completeActiveTools(opts: { keepBackground?: boolean } = {}): void {
+    const kept: string[] = [];
     for (const msgId of this.#activeToolMsgIds) {
+      if (opts.keepBackground && this.#isBackgroundToolMessage(msgId)) {
+        kept.push(msgId);
+        continue;
+      }
       if (this.#toolCallsClosedByResult.has(msgId)) continue;
       this._applyInterruptedStateToTool(msgId);
     }
-    this.#activeToolMsgIds = [];
+    this.#activeToolMsgIds = kept;
+  }
+
+  /**
+   * The provider reports no live background work and no turn is in flight, so
+   * anything a sub-agent still holds open is stale: a tool whose result was
+   * lost, an approval its agent will never receive, a registration whose
+   * SubagentStop never came. The same reconciliation turn exit does, deferred
+   * to the point it is actually true.
+   */
+  #reconcileDrainedBackground(): void {
+    this.#completeActiveTools();
+    if (this.#pendingApprovals.size > 0) {
+      const systemAuth: AuthContext = { sub: "system", scopes: [], delegationDepth: 0, accountId: this.accountId, projectId: this.projectId };
+      for (const [aid, resolveFn] of [...this.#pendingApprovals.entries()]) {
+        resolveFn({ approved: false });
+        this.#dismissStaleApproval(aid, systemAuth);
+        this.#pendingApprovals.delete(aid);
+      }
+    }
+    this.#sweepStaleSubagents("background tasks drained");
+    this.#settleBetweenTurns();
+  }
+
+  /** A tool call that can outlive its turn (see #backgroundToolMsgIds). */
+  #isBackgroundToolMessage(msgId: string): boolean {
+    return this.#backgroundToolMsgIds.has(msgId);
+  }
+
+  /** A pending approval raised by a sub-agent's tool call. */
+  #isBackgroundApproval(approvalId: string): boolean {
+    const msgId = this.#approvalIdToMessageId.get(approvalId);
+    return msgId !== undefined && this.#isBackgroundToolMessage(msgId);
   }
 
   /**
@@ -4542,6 +4644,7 @@ export class Session {
       this.#messageIdToToolUseId.delete(msgId);
     }
     this.#toolCallMessages.delete(msgId);
+    this.#backgroundToolMsgIds.delete(msgId);
     // Drop the provider-declared patch whitelist AND the approval→message
     // mapping for this tool's approval — the approval will never resolve
     // now. Leaving the mapping alive did two bad things: the map leaked one
@@ -4654,6 +4757,31 @@ export class Session {
       if (oldest !== undefined) this.#seenClientMsgIds.delete(oldest);
     }
     return false;
+  }
+
+  /** A turn is in flight — its consumer owns the status until turn exit. */
+  #turnActive(): boolean {
+    return this.#activeRun !== null;
+  }
+
+  /**
+   * Set a status that only means something inside a turn (thinking,
+   * tool_running). Between turns it is a no-op: the event came from a
+   * background agent, and a turn status with no turn to end it is exactly the
+   * stuck "tool_running" that kept the background wake from ever firing.
+   */
+  #setTurnStatus(status: SessionStatus): void {
+    if (this.#turnActive()) this.#setStatus(status);
+  }
+
+  /**
+   * A background approval was decided with no turn in flight: back to idle
+   * once none is left pending, which also delivers any background reports
+   * that queued while the session waited on it.
+   */
+  #settleBetweenTurns(): void {
+    if (this.#turnActive() || this.#pendingApprovals.size > 0) return;
+    if (this.#status === "waiting_approval") this.#setStatus("idle");
   }
 
   #setStatus(status: SessionStatus): void {
