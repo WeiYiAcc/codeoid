@@ -94,9 +94,13 @@ const settled = (taskId: string): SessionScopedEvent => ({
   summary: `summary for ${taskId}`,
 });
 
-function makeSession(script: ProviderEvent[][], opts: { stall?: boolean } = {}) {
+function makeSession(
+  script: ProviderEvent[][],
+  opts: { stall?: boolean; continues?: boolean; fallbackMs?: number; midTurn?: boolean; hooks?: unknown } = {},
+) {
   const id = randomUUID();
-  const provider = new MockSessionProvider("mock", script, opts);
+  const provider = new MockSessionProvider("mock", script, { stall: opts.stall, midTurn: opts.midTurn });
+  provider.continuesAfterBackgroundWork = opts.continues ?? false;
   const registry = new ProviderRegistry("mock");
   registry.register({ id: "mock", displayName: "mock", create: () => provider });
   store.createSession({
@@ -119,6 +123,8 @@ function makeSession(script: ProviderEvent[][], opts: { stall?: boolean } = {}) 
     existingId: id,
     providers: registry,
     providerId: "mock",
+    ...(opts.fallbackMs !== undefined ? { backgroundWakeFallbackMs: opts.fallbackMs } : {}),
+    ...(opts.hooks !== undefined ? { hooks: opts.hooks as never } : {}),
   });
   const fire = (e: SessionScopedEvent) => {
     if (!provider.onSessionEvent) throw new Error("Session never wired onSessionEvent");
@@ -325,5 +331,130 @@ describe("turn exit while background work is live", () => {
     expect(decided).toBe("deny");
     await waitFor(() => session.status === "idle");
     expect(session.toInfo().subagents ?? []).toHaveLength(0);
+  });
+});
+
+// ── 3. Turns the backend starts on its own ───────────────────────────────────
+//
+// Measured live against the real CLI (codeoid's own wake disabled): ~20s after
+// the main turn ended, the CLI ran the main agent by itself to report the
+// finished background task — thinking, reply, turn_done — and every event was
+// dropped for want of an open turn. An approval inside such a turn is the
+// "A tool approval is pending" nobody could see.
+
+const assistantText = (client: { received: DaemonMessage[] }): string[] =>
+  client.received
+    .filter((m) => m.type === "session.message" && (m as SessionMessage).role === "assistant")
+    .map((m) => (m as SessionMessage).content);
+
+describe("a turn the backend starts on its own", () => {
+  it("is consumed like a prompted turn: the reply renders and the session returns to idle", async () => {
+    const { session, provider } = makeSession([[done()]], { continues: true });
+    const client = recordingClient();
+    session.attach(client);
+    await session.send("start background work", AUTH);
+    await waitFor(() => session.status === "idle");
+
+    provider.startOwnTurn([text("The background agent printed BG-DONE."), done()]);
+    await waitFor(() => assistantText(client).includes("The background agent printed BG-DONE."));
+    await waitFor(() => session.status === "idle");
+    // Said why a turn appeared with no prompt.
+    const note = client.received.find(
+      (m) => m.type === "session.message" && (m as SessionMessage).metadata?.event === "turn.adopted",
+    );
+    expect(note).toBeDefined();
+  });
+
+  it("renders an approval requested inside it, and the owner can answer", async () => {
+    const { session, provider } = makeSession([[done()]], { continues: true });
+    const client = recordingClient();
+    session.attach(client);
+    await session.send("go", AUTH);
+    await waitFor(() => session.status === "idle");
+
+    const call = toolCall("Bash"); // the MAIN agent's tool call
+    const push = provider.startOwnTurn([call.event]);
+    let decided: "allow" | "deny" | undefined;
+    void provider.capturedOpts.at(-1)!
+      .canUseTool(call.event.toolId, call.event.approvalId, call.event.name, call.event.input)
+      .then((r) => { decided = r.behavior; });
+    await waitFor(() => session.status === "waiting_approval");
+    expect(toolMessage(client, call.event.approvalId)?.tool?.name).toBe("Bash");
+
+    session.approve(call.event.approvalId, true, AUTH);
+    await waitFor(() => decided === "allow");
+    push(done());
+    await waitFor(() => session.status === "idle");
+  });
+});
+
+describe("waking a backend that continues on its own", () => {
+  it("does not inject a second turn when the backend starts its own", async () => {
+    const { session, provider, fire } = makeSession([[done()]], { continues: true, fallbackMs: 150 });
+    session.attach(recordingClient());
+    await session.send("go", AUTH);
+    await waitFor(() => session.status === "idle");
+
+    fire(settled("t1"));
+    provider.startOwnTurn([text("reporting t1"), done()]);
+    await waitFor(() => session.status === "idle");
+    await new Promise((r) => setTimeout(r, 300)); // well past the fallback
+    // Only the owner's prompt reached the backend — no duplicate wake.
+    expect(prompts(provider)).toEqual(["go"]);
+  });
+
+  it("wakes the session itself if the backend never continues", async () => {
+    const { session, provider, fire } = makeSession([[done()], [done()]], { continues: true, fallbackMs: 100 });
+    session.attach(recordingClient());
+    await session.send("go", AUTH);
+    await waitFor(() => session.status === "idle");
+
+    fire(settled("t1"));
+    expect(prompts(provider)).toHaveLength(1); // not immediately
+    await waitFor(() => prompts(provider).length === 2, 2000);
+    expect(prompts(provider)[1]).toContain("task t1");
+  });
+
+  it("treats a result that settles mid-turn as delivered in that turn", async () => {
+    const { session, provider, fire } = makeSession([[text("working")]], { continues: true, fallbackMs: 100, stall: true });
+    session.attach(recordingClient());
+    void session.send("go", AUTH);
+    await waitFor(() => session.status === "thinking");
+
+    fire(settled("t1")); // the backend injects it into this very turn
+    provider.emitLive(done());
+    await waitFor(() => session.status === "idle");
+    await new Promise((r) => setTimeout(r, 300));
+    expect(prompts(provider)).toEqual(["go"]);
+  });
+
+  it("joins a turn the backend started while the owner's message was on its way", async () => {
+    // The race: the backend starts its own turn AFTER the send decided the
+    // session was idle but BEFORE it started a turn. A before_turn hook is the
+    // await in that window, so the stand-in starts the backend's turn there.
+    let push: ((e: ProviderEvent) => boolean) | undefined;
+    // The hook needs the provider, which exists only once the session does.
+    const ref: { provider?: MockSessionProvider } = {};
+    const hooks = {
+      hasHooks: (event: string) => event === "before_turn",
+      dispatchBeforeTurn: async () => {
+        push = ref.provider!.startOwnTurn([text("reporting")]);
+        await tick();
+        return {};
+      },
+      emit: () => {},
+    };
+    const { session, provider } = makeSession([[done()]], { continues: true, midTurn: true, hooks });
+    ref.provider = provider;
+    session.attach(recordingClient());
+
+    await session.send("is it done?", AUTH);
+    // Joined the backend's turn — no competing runTurn that would close its queue.
+    expect(prompts(provider)).toEqual([]);
+    expect(provider.midTurnPushes.map((p) => p.content)).toEqual(["is it done?"]);
+    // The push queried: one turn_done for it, one for the backend's own turn.
+    push!(done());
+    push!(done());
+    await waitFor(() => session.status === "idle");
   });
 });

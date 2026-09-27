@@ -132,6 +132,14 @@ const STATUS_PERSIST_DEBOUNCE_MS = 500;
 const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
 
 /**
+ * How long a self-continuing backend gets, after background work settles with
+ * the session idle, to start its own turn before the session wakes itself.
+ * The Claude CLI starts one within a few seconds; this only has to outlast
+ * that, and it bounds the stall if the backend ever does not continue.
+ */
+const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
+
+/**
  * Max serialized message payload per scrollback.replay frame (#84). Kept well
  * under the server's 16 MB WS outbound backpressure limit (server.ts) so a
  * single chunk — plus the frame envelope and any concurrent traffic — never
@@ -229,6 +237,8 @@ export interface SessionCreateOptions {
    * its catalog. Undefined when nothing is known for that model in that scope.
    */
   modelWindow?: (scope: WindowScope, providerId: string, model: string) => number | undefined;
+  /** Override for BACKGROUND_WAKE_FALLBACK_MS (tests). */
+  backgroundWakeFallbackMs?: number;
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -615,6 +625,9 @@ export class Session {
    * tool_start it closes.
    */
   #backgroundEventChain: Promise<void> = Promise.resolve();
+  /** Pending fallback wake for a self-continuing backend (#armBackgroundWakeFallback). */
+  #backgroundWakeFallback: ReturnType<typeof setTimeout> | null = null;
+  #backgroundWakeFallbackMs = BACKGROUND_WAKE_FALLBACK_MS;
 
   #subagents = new Map<
     string,
@@ -781,6 +794,7 @@ export class Session {
     this.#onModels = opts.onModels;
     this.#onModelLimits = opts.onModelLimits;
     this.#modelWindow = opts.modelWindow;
+    this.#backgroundWakeFallbackMs = opts.backgroundWakeFallbackMs ?? BACKGROUND_WAKE_FALLBACK_MS;
     this.#hookBus = opts.hooks;
     // Advisory guard. Config is validated in the guard constructor and fails
     // loud there; here we degrade to "no guard" and log, because an advisory
@@ -1976,6 +1990,18 @@ export class Session {
       ));
     }
 
+    // The backend may have started a turn on its own while this send awaited
+    // (hooks, identity) — join it rather than start a second turn over it,
+    // whose runTurn would close the adopted queue mid-reply.
+    const adopted = this.#activeRun;
+    if (adopted?.pushMidTurn) {
+      this.#accumulator.pushUserTurn(effectivePrompt);
+      adopted.pushMidTurn(effectivePrompt, "now");
+      this.#pendingMidTurnCount++;
+      this.#broadcastInfoUpdate();
+      return;
+    }
+
     this.#accumulator.pushUserTurn(effectivePrompt);
     const run = this.#provider.runTurn({
       history: this.#accumulator.history,
@@ -1994,6 +2020,7 @@ export class Session {
     this.#activeRun = run;
     this.#eventConsumerTask = this.#consumeEvents(run, sender);
     this.#setStatus("thinking");
+    this.#onTurnStarted();
     // Broadcast info_update so StatusBar reflects the new queue depth.
     this.#broadcastInfoUpdate();
   }
@@ -2080,10 +2107,91 @@ export class Session {
         // The level event usually removes it too, but do not depend on
         // ordering the contract leaves unspecified.
         if (this.#backgroundTasks.delete(event.taskId)) this.#broadcastInfoUpdate();
-        this.#maybeDeliverBackgroundReports();
+        if (this.#provider.continuesAfterBackgroundWork) {
+          // The backend delivers the result to the model itself — into the
+          // running turn, or by starting one (turn_started). Our own wake would
+          // be a second turn about the same result. Only if no turn is running
+          // and none begins soon do we wake the session ourselves.
+          if (this.#turnActive()) this.#pendingBackgroundReports = [];
+          else this.#armBackgroundWakeFallback();
+        } else {
+          this.#maybeDeliverBackgroundReports();
+        }
+        break;
+      }
+      case "turn_started": {
+        this.#adoptTurn(event.run);
         break;
       }
     }
+  }
+
+  /**
+   * Consume a turn the backend started on its own (e.g. the Claude CLI
+   * answering a finished background task). It runs exactly like a prompted
+   * turn — same consumer, same approval gate — so its reply, tool calls and
+   * approvals render, and its turn_done returns the session to idle.
+   */
+  #adoptTurn(run: TurnRun): void {
+    if (this.#turnActive()) {
+      // Cannot happen while a turn queue is open (the provider only adopts
+      // with none); if it ever does, never run two consumers.
+      console.error(`[codeoid/session ${this.id.slice(0, 8)}] backend started a turn while one is active — ignoring`);
+      run.endTurn?.();
+      return;
+    }
+    const systemAuth: AuthContext = {
+      sub: "system:background",
+      scopes: [],
+      delegationDepth: 0,
+      accountId: this.accountId,
+      projectId: this.projectId,
+    };
+    this.#store.audit(systemAuth.sub, "session.turn_adopted", this.id);
+    // A turn with no prompt reads as the agent talking to itself; say why.
+    const note = this.#makeMessage(
+      "info",
+      "↻ Continuing after background work finished",
+      SYSTEM_IDENTITY,
+      undefined,
+      undefined,
+      { event: "turn.adopted" },
+    );
+    this.#persistAndBuffer(note);
+    this.#broadcastRaw(note);
+    this.#activeRun = run;
+    this.#eventConsumerTask = this.#consumeEvents(run, systemAuth);
+    this.#setStatus("thinking");
+    this.#onTurnStarted();
+    this.#broadcastInfoUpdate();
+  }
+
+  /**
+   * A turn is now running. For a backend that continues after background work
+   * by itself, it delivers any settled results into this turn — so our queued
+   * digests are delivered, and the fallback wake is moot.
+   */
+  #onTurnStarted(): void {
+    if (!this.#provider.continuesAfterBackgroundWork) return;
+    this.#pendingBackgroundReports = [];
+    if (this.#backgroundWakeFallback) {
+      clearTimeout(this.#backgroundWakeFallback);
+      this.#backgroundWakeFallback = null;
+    }
+  }
+
+  /**
+   * Wake the session ourselves if a self-continuing backend has not started a
+   * turn within the grace window after a settle — the safety net that keeps a
+   * backend that failed to continue from reintroducing the stall.
+   */
+  #armBackgroundWakeFallback(): void {
+    if (this.#backgroundWakeFallback) return;
+    this.#backgroundWakeFallback = setTimeout(() => {
+      this.#backgroundWakeFallback = null;
+      this.#maybeDeliverBackgroundReports();
+    }, this.#backgroundWakeFallbackMs);
+    this.#backgroundWakeFallback.unref?.();
   }
 
   /**
@@ -2403,6 +2511,10 @@ export class Session {
     if (this.#statusPersistTimer) {
       clearTimeout(this.#statusPersistTimer);
       this.#statusPersistTimer = null;
+    }
+    if (this.#backgroundWakeFallback) {
+      clearTimeout(this.#backgroundWakeFallback);
+      this.#backgroundWakeFallback = null;
     }
     this.#store.audit(sender.sub, "session.destroy", this.id);
     // Hook seam: observe-only lifecycle notification.

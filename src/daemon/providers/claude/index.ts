@@ -145,6 +145,30 @@ export interface ClaudeProviderInit {
  * would end the next turn the moment it starts) and streamed text (it would
  * corrupt the next turn's transcript).
  */
+/**
+ * Events that mean the MAIN agent is running — the first of these arriving
+ * with no turn open is the start of a turn the CLI began on its own. Sub-agent
+ * output is excluded: it carries its parent tool call (text/thinking), is not
+ * primary (llm_call), or names its agent (tool_start).
+ */
+export function opensAdoptedTurn(event: ProviderEvent): boolean {
+  switch (event.type) {
+    case "mcp_init": // the SDK's per-query init: a new model turn is starting
+      return true;
+    case "text_delta":
+    case "text_done":
+    case "thinking_delta":
+    case "thinking_done":
+      return (event.parentToolUseId ?? null) === null;
+    case "llm_call":
+      return event.isPrimary === true;
+    case "tool_start":
+      return event.sdkAgentId === undefined;
+    default:
+      return false;
+  }
+}
+
 export const CARRYOVER_EVENT_TYPES: ReadonlySet<ProviderEvent["type"]> = new Set([
   "subagent_stop",
   "tool_complete",
@@ -158,6 +182,8 @@ export const MAX_CARRYOVER_EVENTS = 100;
 
 export class ClaudeProvider implements SessionProvider {
   readonly id = "claude";
+  /** The CLI runs the main agent itself when background work settles (#adoptTurn). */
+  readonly continuesAfterBackgroundWork = true;
   readonly displayName = "Claude (Anthropic)";
 
   // Claude-specific backing-session state
@@ -321,6 +347,11 @@ export class ClaudeProvider implements SessionProvider {
     if (userMessage) {
       this.#pushSDKMessage(userMessage, "later");
     }
+    return this.#makeTurnRun(turnQueue);
+  }
+
+  /** The TurnRun handle over one turn queue — shared by prompted and adopted turns. */
+  #makeTurnRun(turnQueue: AsyncQueue<ProviderEvent>): TurnRun {
     return {
       events: turnQueue,
       interrupt: async () => {
@@ -846,7 +877,30 @@ export class ClaudeProvider implements SessionProvider {
         return;
       }
     }
+    if (this.#adoptTurn(event)) return;
     this.#handleUndeliverable(event, "no-queue");
+  }
+
+  /**
+   * The main agent is running with no turn open: the CLI started a turn on its
+   * own — it does this to answer a finished background task, delivering the
+   * result to the model as harness input. Open a turn queue for it and hand it
+   * to the session, which consumes it like a prompted turn. Before this the
+   * whole turn was dropped event by event: its reply never rendered, and an
+   * approval requested inside it blocked the session on a prompt nobody saw.
+   *
+   * Only MAIN-agent activity opens a turn — a sub-agent's text/thinking
+   * (tagged with its parent tool call), its model calls, and its lifecycle
+   * events are background work, not a turn.
+   */
+  #adoptTurn(event: ProviderEvent): boolean {
+    const onSessionEvent = this.onSessionEvent;
+    if (!onSessionEvent || !opensAdoptedTurn(event)) return false;
+    const turnQueue = new AsyncQueue<ProviderEvent>();
+    this.#currentTurnQueue = turnQueue;
+    turnQueue.push(event);
+    onSessionEvent({ type: "turn_started", run: this.#makeTurnRun(turnQueue) });
+    return true;
   }
 
   /**

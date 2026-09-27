@@ -285,7 +285,7 @@ export interface BackgroundTaskSnapshot {
  * observed live — a session promised a report, its tasks settled into a closed
  * queue, and it sat idle until the owner interrupted it.
  *
- * Three events. The first two mirror the level+edge design the Claude SDK
+ * Four events. The first two mirror the level+edge design the Claude SDK
  * itself settled on:
  *
  * - `background_tasks` is a LEVEL: the full live set after any membership
@@ -299,6 +299,12 @@ export interface BackgroundTaskSnapshot {
  *   so their tool calls (and the approvals those need) routinely land between
  *   turns; sent to the turn queue they were dropped, the approval card never
  *   rendered, and the session sat blocked on a prompt nobody could see.
+ * - `turn_started` hands the session a turn the BACKEND started on its own.
+ *   The Claude CLI answers a finished background task by running the main
+ *   agent itself — no prompt from codeoid. With no turn queue open, that whole
+ *   turn (its reply, its tool calls and their approvals, its turn_done) was
+ *   dropped: the owner saw nothing, and an approval inside it wedged the
+ *   session invisibly. The session consumes it like any turn it started.
  *
  * Provider-agnostic on purpose: claude maps its SDK notifications onto these
  * today; pi/gemini/codex emit nothing until their harnesses grow background
@@ -314,7 +320,8 @@ export type SessionScopedEvent =
       /** Compressed outcome — what the session is woken with. Never a raw transcript. */
       summary: string;
     }
-  | { type: "background_event"; event: BackgroundLifecycleEvent };
+  | { type: "background_event"; event: BackgroundLifecycleEvent }
+  | { type: "turn_started"; run: TurnRun };
 
 /** The provider events a background agent emits on its own, between turns. */
 export type BackgroundLifecycleEvent = Extract<
@@ -485,6 +492,14 @@ export interface SessionProvider extends AgentProvider {
    * background work simply never call it.
    */
   onSessionEvent?: ((event: SessionScopedEvent) => void) | undefined;
+  /**
+   * The backend continues the conversation by itself when background work it
+   * started settles (delivering the result to the model and running a turn,
+   * surfaced as `turn_started`). The session then waits for that turn instead
+   * of injecting its own wake, which would be a second, duplicate turn — and
+   * wakes itself only as a fallback if no turn begins.
+   */
+  readonly continuesAfterBackgroundWork?: boolean;
   /** Underlying backing session ID (for display and Store persistence). */
   readonly backingSessionId: string;
   /** True once runTurn() has been called at least once (guards agent registration). */

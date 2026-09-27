@@ -1796,14 +1796,61 @@ describe("ClaudeProvider — background agent events with no turn in flight", ()
     expect(got).toEqual(lifecycle.map((event) => ({ type: "background_event", event })));
   });
 
-  it("never reroutes turn-scoped events — a stale turn_done or text would corrupt the next turn", () => {
+  it("never opens a turn for a lone turn boundary — a stale turn_done or error would end the next turn", () => {
     const provider = makeProvider();
     const got: SessionScopedEvent[] = [];
     provider.onSessionEvent = (e) => got.push(e);
 
-    provider._emitForTest({ type: "text_done", content: "late" });
     provider._emitForTest({ type: "turn_done", result: { providerId: "claude", model: "m", inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 0 } });
+    provider._emitForTest({ type: "error", message: "late" });
 
     expect(got).toEqual([]);
+  });
+});
+
+describe("ClaudeProvider — adopting a turn the CLI starts on its own", () => {
+  it("declares that it continues after background work", () => {
+    expect(makeProvider().continuesAfterBackgroundWork).toBe(true);
+  });
+
+  it("opens a turn on the first main-agent event and routes the rest of the turn into it", async () => {
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    provider._emitForTest({ type: "mcp_init", servers: {}, tools: {} });
+    provider._emitForTest({ type: "text_done", content: "The background agent printed BG-DONE.", parentToolUseId: null });
+    provider._emitForTest({ type: "turn_done", result: { providerId: "claude", model: "m", inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 0 } });
+
+    expect(got.map((e) => e.type)).toEqual(["turn_started"]);
+    const run = (got[0] as Extract<SessionScopedEvent, { type: "turn_started" }>).run;
+    const seen: string[] = [];
+    run.endTurn?.();
+    for await (const e of run.events) seen.push(e.type);
+    expect(seen).toEqual(["mcp_init", "text_done", "turn_done"]);
+  });
+
+  it("never opens a turn for a sub-agent's own activity", () => {
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    provider._emitForTest({ type: "text_done", content: "sub-agent's final message", parentToolUseId: "toolu_agent" });
+    provider._emitForTest({ type: "thinking_delta", content: "…", parentToolUseId: "toolu_agent" });
+    provider._emitForTest({ type: "llm_call", usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 }, isPrimary: false });
+
+    expect(got.filter((e) => e.type === "turn_started")).toEqual([]);
+  });
+
+  it("opens a turn for the main agent's tool call, but not a sub-agent's", () => {
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    provider._emitForTest({ type: "tool_start", toolId: "t2", sdkToolUseId: "u2", sdkAgentId: "agent-1", name: "Bash", input: {}, approvalId: "a2" });
+    expect(got.map((e) => e.type)).toEqual(["background_event"]);
+
+    provider._emitForTest({ type: "tool_start", toolId: "t3", sdkToolUseId: "u3", name: "Bash", input: {}, approvalId: "a3" });
+    expect(got.map((e) => e.type)).toEqual(["background_event", "turn_started"]);
   });
 });
