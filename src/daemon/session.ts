@@ -2471,13 +2471,13 @@ export class Session {
     // before we even await the SDK — instant feedback.
     this.#flushActiveAssistant();
     this.#finalizeActiveThinking();
-    // Unblock any pending tool approvals so canUseTool awaiters don't leak.
-    for (const resolve of this.#pendingApprovals.values()) {
-      resolve({ approved: false });
-    }
-    this.#pendingApprovals.clear();
+    // Unblock pending tool approvals so canUseTool awaiters don't leak — the
+    // turn's, not a live background agent's: Stop ends the turn, and a
+    // background agent outlives it (killing it is the CLI's call, reported
+    // through the background set).
+    this.#denyPendingApprovals({ keepBackground: this.#backgroundWorkLive() });
     this.#earlyApprovals.clear();
-    this.#approvalPatchKeys.clear();
+    if (this.#pendingApprovals.size === 0) this.#approvalPatchKeys.clear();
     // Same for provider dialogs — an interrupted turn must not leave the
     // provider awaiting an answer that can no longer arrive.
     this.#cancelAllUiRequests("interrupted");
@@ -2497,17 +2497,16 @@ export class Session {
     if (run) {
       try {
         await run.interrupt();
-        // Interrupting kills the turn, so every sub-agent it spawned is done
-        // whether or not the SDK got to run their stop hooks.
-        this.#sweepStaleSubagents("interrupt");
-        if (this.#status !== "error") this.#setStatus("idle");
-        return;
       } catch {
-        // fall through to hard abort
+        // fall through — the provider's own fallback is a hard abort
       }
     }
-    this.#sweepStaleSubagents("interrupt");
-    if (this.#status !== "error") this.#setStatus("idle");
+    // The turn's sub-agents are done whether or not the SDK ran their stop
+    // hooks; live background agents are not. Read the set AFTER interrupting:
+    // a hard abort kills the CLI and announces the set empty, so everything
+    // is reconciled then. Stop with no turn in flight touches only leftovers.
+    this.#reconcileWork("interrupt", { keepBackground: this.#backgroundWorkLive() });
+    if (this.#status !== "error") this.#setStatus(this.#pendingApprovals.size > 0 ? "waiting_approval" : "idle");
   }
 
   approve(

@@ -813,3 +813,75 @@ describe("wake digest hardening", () => {
     await waitFor(() => session.status === "idle");
   });
 });
+
+// ── 6. Audit round 3 regression: Stop ────────────────────────────────────────
+
+describe("Stop while background work is live", () => {
+  it("with no turn in flight, leaves the background agent and its approval alone", async () => {
+    // Before: Stop swept and revoked the live agent and denied its approval,
+    // while the background set still reported it running.
+    const { session, provider, fire, backgroundToolCall } = makeSession([[text("working"), spawn("agent-1")]], { stall: true });
+    session.attach(recordingClient());
+    void session.send("go", AUTH);
+    await waitFor(() => session.toInfo().subagents?.length === 1);
+    fire(liveBackground("t1"));
+    provider.emitLive(done());
+    await waitFor(() => provider.endTurnCount === 1);
+
+    const call = toolCall("Bash", "agent-1");
+    let decided: "allow" | "deny" | undefined;
+    void backgroundToolCall(call, false).then((r) => { decided = r.behavior; });
+    await waitFor(() => session.status === "waiting_approval");
+
+    await session.interrupt(AUTH);
+    await tick();
+    expect(decided).toBeUndefined();
+    expect(session.toInfo().subagents?.length).toBe(1);
+    expect(session.status).toBe("waiting_approval");
+
+    session.approve(call.event.approvalId, true, AUTH);
+    await waitFor(() => decided === "allow");
+    await waitFor(() => session.status === "idle");
+  });
+
+  it("mid-turn, stops the turn's own approval but keeps the background agent's", async () => {
+    const { session, fire, backgroundToolCall } = makeSession([[text("working"), spawn("agent-1")]], { stall: true });
+    session.attach(recordingClient());
+    void session.send("go", AUTH);
+    await waitFor(() => session.toInfo().subagents?.length === 1);
+    fire(liveBackground("t1"));
+
+    let mainDecided: "allow" | "deny" | undefined;
+    let bgDecided: "allow" | "deny" | undefined;
+    void backgroundToolCall(toolCall("Bash"), true).then((r) => { mainDecided = r.behavior; });
+    const bg = toolCall("Bash", "agent-1");
+    void backgroundToolCall(bg, true).then((r) => { bgDecided = r.behavior; });
+    await waitFor(() => session.status === "waiting_approval");
+    await tick();
+
+    await session.interrupt(AUTH);
+    await waitFor(() => mainDecided !== undefined);
+    expect(mainDecided).toBe("deny");
+    expect(bgDecided).toBeUndefined();
+    expect(session.toInfo().subagents?.length).toBe(1);
+
+    session.approve(bg.event.approvalId, true, AUTH);
+    await waitFor(() => bgDecided === "allow");
+  });
+
+  it("with no background work live, still ends everything as before", async () => {
+    const { session, backgroundToolCall } = makeSession([[text("working"), spawn("agent-1")]], { stall: true });
+    session.attach(recordingClient());
+    void session.send("go", AUTH);
+    await waitFor(() => session.toInfo().subagents?.length === 1);
+    let decided: "allow" | "deny" | undefined;
+    void backgroundToolCall(toolCall("Bash", "agent-1"), true).then((r) => { decided = r.behavior; });
+    await waitFor(() => session.status === "waiting_approval");
+
+    await session.interrupt(AUTH);
+    await waitFor(() => decided !== undefined);
+    expect(decided).toBe("deny");
+    expect(session.toInfo().subagents ?? []).toHaveLength(0);
+    expect(session.status).toBe("idle");
+  });
+});
