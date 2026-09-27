@@ -848,6 +848,12 @@ export class ClaudeProvider implements SessionProvider {
         if (this.#loopGeneration === myGeneration) {
           this.#currentTurnQueue?.close();
           this.#currentTurnQueue = null;
+          // However the loop ended — clean exit, the CLI crashing, a hard
+          // abort, backing-session recovery — the CLI is gone and its
+          // background tasks with it, and a dead CLI never sends the empty
+          // level. Say so, or the session keeps treating dead background
+          // agents as live and skips their cleanup at every boundary.
+          this.onSessionEvent?.({ type: "background_tasks", tasks: [] });
         }
 
         if (this.#query === query$) this.#query = null;

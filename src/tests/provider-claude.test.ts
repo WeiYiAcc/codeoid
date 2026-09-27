@@ -1432,6 +1432,20 @@ describe("ClaudeProvider – systemPromptAppend loop rebuild (#153)", () => {
     await shutdown(provider);
   });
 
+  it("announces an empty background set whenever the loop ends — a dead CLI never sends one", async () => {
+    // A crash, a hard abort, backing-session recovery: however the loop ends,
+    // its background tasks die with it.
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+    const run = turn(provider, "sprint: alpha", "t1");
+    openGate(); // the mock stream ends: the loop exits
+    for await (const _ of run.events) { /* drain */ }
+    await Bun.sleep(5);
+    expect(got).toContainEqual({ type: "background_tasks", tasks: [] });
+    await provider.teardown();
+  });
+
   it("treats absent and empty appends as the same loop configuration", async () => {
     const provider = makeProvider();
     turn(provider, undefined, "t1");

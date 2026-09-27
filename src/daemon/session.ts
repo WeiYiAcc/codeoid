@@ -28,6 +28,7 @@ import {
   isSubagentEvent,
   type BackgroundTaskSnapshot,
   type SessionScopedEvent,
+  type TurnOpts,
   type CatalogEntry,
   isPlaceholderModel,
 } from "./providers/interface.js";
@@ -147,7 +148,14 @@ const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
  * early and speak outside the "NOT a message from the owner" framing.
  */
 function formatDigest(summary: string): string {
-  const [first = "", ...rest] = summary.replace(/<\/?background_tasks>/gi, "[background_tasks]").split("\n");
+  const normalized = summary
+    // Every line break a model (or terminal) honours, not just \n.
+    .replace(/\r\n?|[\u0085\u2028\u2029]/g, "\n")
+    // Invisible format characters could hide a tag from the check below.
+    .replace(/\p{Cf}/gu, "")
+    // The block's tags in any spelling a model would still read as a tag.
+    .replace(/[<\uFF1C]\s*\/?\s*background_tasks[^>\uFF1E]*[>\uFF1E]/gi, "[background_tasks]");
+  const [first = "", ...rest] = normalized.split("\n");
   return [first, ...rest.map((line) => `  ${line}`)].join("\n");
 }
 
@@ -1915,6 +1923,9 @@ export class Session {
       // neither the mid-turn flush nor the consumer's finally reconciles them,
       // because the loop never exits.
       if (effectivePriority !== "later") this.#pendingMidTurnCount++;
+      // Joining a turn the backend started on its own: the owner is now
+      // steering it, so its approvals and audit are theirs from here on.
+      this.#activeRun.bindGate?.(this.#gateFor(sender));
       this.#activeRun.pushMidTurn(effectivePrompt, effectivePriority);
       // Keep waiting_approval AND tool_running visible. Both are real states the
       // push does not end, and both are load-bearing in two places:
@@ -2010,6 +2021,7 @@ export class Session {
     const adopted = this.#activeRun;
     if (adopted?.pushMidTurn) {
       this.#accumulator.pushUserTurn(effectivePrompt);
+      adopted.bindGate?.(this.#gateFor(sender));
       adopted.pushMidTurn(effectivePrompt, "now");
       this.#pendingMidTurnCount++;
       this.#broadcastInfoUpdate();
@@ -2174,11 +2186,12 @@ export class Session {
     this.#store.audit(systemAuth.sub, "session.turn_adopted", this.id);
     // Its own gate and principal: approvals and audit in this turn belong to
     // system:background, not to whoever prompted the previous turn.
-    run.bindGate?.({
-      canUseTool: this.#makeCanUseToolFn(systemAuth),
-      requestUserInput: (req) => this.requestUserInput(req),
-      sender: systemAuth,
-    });
+    run.bindGate?.(this.#gateFor(systemAuth));
+    // The model's input for this turn was the harness delivering background
+    // results. Record it, or canonical history holds two assistant turns in a
+    // row — which a stateless backend reached by a later switch may reject.
+    this.#accumulator.pushUserTurn("(Background work finished; the agent harness delivered the results.)");
+    this.#turnInterrupted = false;
     // A turn with no prompt reads as the agent talking to itself; say why.
     const note = this.#makeMessage(
       "info",
@@ -2195,6 +2208,15 @@ export class Session {
     this.#setStatus("thinking");
     this.#onTurnStarted();
     this.#broadcastInfoUpdate();
+  }
+
+  /** The approval gate, dialog handler and principal a turn acts under. */
+  #gateFor(sender: AuthContext): Pick<TurnOpts, "canUseTool" | "requestUserInput" | "sender"> {
+    return {
+      canUseTool: this.#makeCanUseToolFn(sender),
+      requestUserInput: (req) => this.requestUserInput(req),
+      sender,
+    };
   }
 
   /**
@@ -2350,14 +2372,29 @@ export class Session {
       });
   }
 
+  /**
+   * Revoke a sub-agent's ZeroID identity, after its registration settles.
+   * Revoking mid-registration was a no-op (the identity manager has no entry
+   * yet) and the registration then completed into a live token nothing
+   * tracked — likelier now that a short background agent can start and drain
+   * in one breath. Fire-and-forget: revocation must never block a boundary,
+   * and deactivateSubagent logs its own failures.
+   */
+  #revokeSubagent(agentId: string): void {
+    const im = this.#identityManager;
+    const fence = this.#subagentRegistrations.get(agentId);
+    this.#subagentRegistrations.delete(agentId);
+    if (!im) return;
+    const revoke = () => void im.deactivateSubagent(this.id, agentId);
+    if (fence) void fence.finally(revoke);
+    else revoke();
+  }
+
   #sweepStaleSubagents(reason: string): void {
     if (this.#subagents.size === 0) return;
     const orphaned = [...this.#subagents.keys()];
     for (const agentId of orphaned) {
-      // Fire-and-forget, matching the subagent_stop path: revocation must never
-      // block a turn boundary, and deactivateSubagent logs its own failures.
-      void this.#identityManager?.deactivateSubagent(this.id, agentId);
-      this.#subagentRegistrations.delete(agentId);
+      this.#revokeSubagent(agentId);
       this.#subagents.delete(agentId);
     }
     // Worth a line: a non-empty sweep means a SubagentStop never arrived, which
@@ -3976,9 +4013,14 @@ export class Session {
     // A background agent's pending approval says nothing about THIS turn —
     // counting it would disable the watchdog for every turn until answered.
     const turnApprovalPending = [...this.#pendingApprovals.keys()].some((aid) => !this.#isBackgroundApproval(aid));
+    // The status alone can lie mid-turn: a background approval flips it to
+    // waiting_approval over a main-agent tool that is still executing, and
+    // the watchdog would then kill that healthy long tool at the stall window.
+    const turnToolInFlight = this.#activeToolMsgIds.some((id) => !this.#isBackgroundToolMessage(id));
     return (
       (this.#status === "waiting_approval" && (turnApprovalPending || this.#pendingApprovals.size === 0)) ||
       this.#status === "tool_running" ||
+      turnToolInFlight ||
       turnApprovalPending ||
       // A provider dialog blocks the provider on a human answer — event-stream
       // silence is expected, exactly like a pending tool approval.
@@ -4441,8 +4483,7 @@ export class Session {
 
       case "subagent_stop": {
         const agentId = event.agentId;
-        void this.#identityManager?.deactivateSubagent(this.id, agentId);
-        this.#subagentRegistrations.delete(agentId);
+        this.#revokeSubagent(agentId);
         // Drop the guard chain with the agent, or a long session accumulates
         // one dead chain per subagent it ever spawned.
         this.#repeatGuard?.resetChain(agentId);
