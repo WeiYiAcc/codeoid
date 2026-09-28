@@ -42,6 +42,7 @@ import { rewriteBashToolInput } from "../../compress/index.js";
 import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
 import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry } from "../interface.js";
+import { isBackgroundLifecycleEvent } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -144,6 +145,30 @@ export interface ClaudeProviderInit {
  * would end the next turn the moment it starts) and streamed text (it would
  * corrupt the next turn's transcript).
  */
+/**
+ * Events that mean the MAIN agent is running — the first of these arriving
+ * with no turn open is the start of a turn the CLI began on its own. Sub-agent
+ * output is excluded: it carries its parent tool call (text/thinking), is not
+ * primary (llm_call), or names its agent (tool_start).
+ */
+export function opensAdoptedTurn(event: ProviderEvent): boolean {
+  switch (event.type) {
+    case "mcp_init": // the SDK's per-query init: a new model turn is starting
+      return true;
+    case "text_delta":
+    case "text_done":
+    case "thinking_delta":
+    case "thinking_done":
+      return (event.parentToolUseId ?? null) === null;
+    case "llm_call":
+      return event.isPrimary === true;
+    case "tool_start":
+      return event.sdkAgentId === undefined;
+    default:
+      return false;
+  }
+}
+
 export const CARRYOVER_EVENT_TYPES: ReadonlySet<ProviderEvent["type"]> = new Set([
   "subagent_stop",
   "tool_complete",
@@ -157,6 +182,8 @@ export const MAX_CARRYOVER_EVENTS = 100;
 
 export class ClaudeProvider implements SessionProvider {
   readonly id = "claude";
+  /** The CLI runs the main agent itself when background work settles (#adoptTurn). */
+  readonly continuesAfterBackgroundWork = true;
   readonly displayName = "Claude (Anthropic)";
 
   // Claude-specific backing-session state
@@ -320,6 +347,26 @@ export class ClaudeProvider implements SessionProvider {
     if (userMessage) {
       this.#pushSDKMessage(userMessage, "later");
     }
+    return this.#makeTurnRun(turnQueue);
+  }
+
+  /** Stop background tasks through the SDK; each emits a `stopped` settle. */
+  async stopBackgroundTasks(taskIds: readonly string[]): Promise<void> {
+    const q = this.#query;
+    if (!q) return;
+    for (const id of taskIds) {
+      try {
+        await q.stopTask(id);
+      } catch (err) {
+        console.error(
+          `[claude-provider ${this.#claudeCodeSessionId.slice(0, 8)}] stopTask ${id} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  /** The TurnRun handle over one turn queue — shared by prompted and adopted turns. */
+  #makeTurnRun(turnQueue: AsyncQueue<ProviderEvent>): TurnRun {
     return {
       events: turnQueue,
       interrupt: async () => {
@@ -334,6 +381,10 @@ export class ClaudeProvider implements SessionProvider {
         }
         this.#abortController?.abort();
         this.#inputQueue?.close();
+        // The hard abort kills the CLI and its background tasks. The loop's
+        // own finally announces that — unless a new turn rebuilds the loop
+        // first and its generation bump silences the old finally. Say it now.
+        this.onSessionEvent?.({ type: "background_tasks", tasks: [] });
       },
       pushMidTurn: (content, priority) => {
         // A "later" mid-turn injection is meant to MERGE into the running turn
@@ -497,6 +548,11 @@ export class ClaudeProvider implements SessionProvider {
       this.#abortController?.abort();
       // The generation bump below orphans the old consumer; its identity-
       // guarded finally cannot clobber the new loop's slots.
+      //
+      // Aborting kills the old CLI, and its background tasks with it — but it
+      // will never send the empty level that says so. Send it here, or the
+      // session keeps treating dead background agents as live work.
+      this.onSessionEvent?.({ type: "background_tasks", tasks: [] });
     }
 
     const init = this.#init;
@@ -663,10 +719,15 @@ export class ClaudeProvider implements SessionProvider {
               // Session's own auto-approve (these are isSafeTool reads) keeps
               // them from prompting.
               if (this.#autoApprovedTools.has(input.tool_name)) {
+                // agent_id is set only when the hook fires inside a sub-agent.
+                // Without it a background agent's recall between turns reads as
+                // the MAIN agent and opens a phantom adopted turn.
+                const agentId = input.agent_id;
                 this.#emit({
                   type: "tool_start",
                   toolId: randomUUID(),
                   sdkToolUseId: input.tool_use_id,
+                  ...(agentId ? { sdkAgentId: agentId } : {}),
                   name: input.tool_name,
                   input: (input.tool_input ?? {}) as Record<string, unknown>,
                   approvalId: randomUUID(),
@@ -750,7 +811,7 @@ export class ClaudeProvider implements SessionProvider {
           // Call Session's approval gate (may block until user responds).
           const canUse = this.#currentCanUseTool;
           if (!canUse) return { behavior: "deny" as const, message: "provider not ready" };
-          const result = await canUse(toolId, approvalId, toolName, inputObj);
+          const result = await canUse(toolId, approvalId, toolName, inputObj, options?.signal);
           if (result.behavior === "allow") {
             return { behavior: "allow", updatedInput: result.updatedInput as Record<string, unknown> | undefined };
           }
@@ -806,6 +867,12 @@ export class ClaudeProvider implements SessionProvider {
         if (this.#loopGeneration === myGeneration) {
           this.#currentTurnQueue?.close();
           this.#currentTurnQueue = null;
+          // However the loop ended — clean exit, the CLI crashing, a hard
+          // abort, backing-session recovery — the CLI is gone and its
+          // background tasks with it, and a dead CLI never sends the empty
+          // level. Say so, or the session keeps treating dead background
+          // agents as live and skips their cleanup at every boundary.
+          this.onSessionEvent?.({ type: "background_tasks", tasks: [] });
         }
 
         if (this.#query === query$) this.#query = null;
@@ -824,6 +891,15 @@ export class ClaudeProvider implements SessionProvider {
     })();
   }
 
+  /**
+   * TS-private test seam: emit as the SDK translation would, so the delivery
+   * policy (turn queue → session channel → carryover) is testable without a
+   * live SDK loop. Do NOT call from production code.
+   */
+  _emitForTest(event: ProviderEvent): void {
+    this.#emit(event);
+  }
+
   /** Push a ProviderEvent to the active per-turn queue. */
   #emit(event: ProviderEvent): void {
     const queue = this.#currentTurnQueue;
@@ -836,7 +912,38 @@ export class ClaudeProvider implements SessionProvider {
         return;
       }
     }
+    if (this.#adoptTurn(event)) return;
     this.#handleUndeliverable(event, "no-queue");
+  }
+
+  /**
+   * The main agent is running with no turn open: the CLI started a turn on its
+   * own — it does this to answer a finished background task, delivering the
+   * result to the model as harness input. Open a turn queue for it and hand it
+   * to the session, which consumes it like a prompted turn. Before this the
+   * whole turn was dropped event by event: its reply never rendered, and an
+   * approval requested inside it blocked the session on a prompt nobody saw.
+   *
+   * Only MAIN-agent activity opens a turn — a sub-agent's text/thinking
+   * (tagged with its parent tool call), its model calls, and its lifecycle
+   * events are background work, not a turn.
+   */
+  #adoptTurn(event: ProviderEvent): boolean {
+    const onSessionEvent = this.onSessionEvent;
+    if (!onSessionEvent || !opensAdoptedTurn(event)) return false;
+    const turnQueue = new AsyncQueue<ProviderEvent>();
+    this.#currentTurnQueue = turnQueue;
+    turnQueue.push(event);
+    const run: TurnRun = {
+      ...this.#makeTurnRun(turnQueue),
+      bindGate: (gate) => {
+        this.#currentCanUseTool = gate.canUseTool;
+        this.#currentRequestUserInput = gate.requestUserInput ?? null;
+        this.#currentSender = gate.sender ?? null;
+      },
+    };
+    onSessionEvent({ type: "turn_started", run });
+    return true;
   }
 
   /**
@@ -857,6 +964,17 @@ export class ClaudeProvider implements SessionProvider {
    * would corrupt its transcript.
    */
   #handleUndeliverable(event: ProviderEvent, reason: string): void {
+    // A background agent's own lifecycle (a tool call, its result, a sub-agent
+    // starting or stopping) happens on the agent's schedule, not the turn's —
+    // it routinely lands after turn_done. Deliver it to the session NOW rather
+    // than dropping it (a dropped tool_start means its approval card never
+    // renders and the session blocks on a prompt nobody can see) or deferring
+    // it to the next turn (a deferred tool_complete strands the status).
+    const onSessionEvent = this.onSessionEvent;
+    if (onSessionEvent && isBackgroundLifecycleEvent(event)) {
+      onSessionEvent({ type: "background_event", event });
+      return;
+    }
     const carryable = CARRYOVER_EVENT_TYPES.has(event.type);
     if (carryable && this.#carryover.length < MAX_CARRYOVER_EVENTS) {
       this.#carryover.push(event);

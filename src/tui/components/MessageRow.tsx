@@ -17,6 +17,7 @@ import type { SessionMessage, ToolInfo } from "../../protocol/types.js";
 import { renderMarkdown, type Segment } from "../markdown.js";
 import { computeDiff, truncateToolOutput } from "../diff.js";
 import { fileUri, maybeLink } from "../osc8.js";
+import { isBackgroundWake, parseBackgroundWake } from "@highflame/codeoid-core";
 
 export interface MessageRowProps {
   msg: SessionMessage;
@@ -25,6 +26,9 @@ export interface MessageRowProps {
 }
 
 export function MessageRow({ msg, live }: MessageRowProps) {
+  // The daemon's background wake is a user-role turn, but not the owner
+  // speaking: show it as a compact list of finished tasks, not a wall of text.
+  if (isBackgroundWake(msg)) return <BackgroundWakeRow content={msg.content} />;
   switch (msg.role) {
     case "user":
       return (
@@ -408,5 +412,24 @@ function renderSegments(segments: Segment[]): React.ReactNode {
         }
       })}
     </Text>
+  );
+}
+
+function BackgroundWakeRow({ content }: { content: string }) {
+  const tasks = parseBackgroundWake(content);
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Text color="gray" bold>
+        Background
+        <Text dimColor>{` · ${tasks.length === 1 ? "1 task" : `${tasks.length} tasks`} finished`}</Text>
+      </Text>
+      {tasks.map((t) => (
+        <Box key={t.taskId} paddingLeft={2}>
+          <Text color={t.status === "completed" ? "gray" : "red"}>{t.status.padEnd(9)}</Text>
+          <Text dimColor>{`${t.taskId}  `}</Text>
+          <Text wrap="truncate-end">{t.headline}</Text>
+        </Box>
+      ))}
+    </Box>
   );
 }

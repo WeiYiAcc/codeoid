@@ -14,7 +14,7 @@
  */
 
 import { mock, describe, it, expect, beforeEach } from "bun:test";
-import type { ProviderEvent , SessionScopedEvent } from "../daemon/providers/interface.js";
+import type { BackgroundLifecycleEvent, ProviderEvent , SessionScopedEvent } from "../daemon/providers/interface.js";
 
 // ── SDK mock ──────────────────────────────────────────────────────────────────
 
@@ -31,6 +31,9 @@ let queryCallCount = 0;
 /** When set, the mock loop blocks before finishing so tests can invoke captured
  *  callbacks (canUseTool, hooks) while the turn queue is still open. */
 let sdkGate: Promise<void> | null = null;
+/** When true, the mock query's interrupt() rejects — forcing the provider's
+ *  hard-abort fallback. */
+let sdkInterruptThrows = false;
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -48,7 +51,9 @@ function makeMockQuery() {
         },
       };
     },
-    interrupt: async () => {},
+    interrupt: async () => {
+      if (sdkInterruptThrows) throw new Error("interrupt unsupported");
+    },
     supportedModels: async () => [{ value: "claude-opus-4", displayName: "Claude Opus 4" }],
   };
 }
@@ -1417,6 +1422,53 @@ describe("ClaudeProvider – systemPromptAppend loop rebuild (#153)", () => {
     await shutdown(provider);
   });
 
+  it("announces an empty background set when a rebuild kills the old CLI", async () => {
+    // Aborting the old loop kills its background agents, but the dead CLI
+    // never sends the empty level — the session kept treating them as live.
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    turn(provider, "sprint: alpha", "t1");
+    expect(got).toEqual([]); // first build: nothing to announce
+    turn(provider, "sprint: beta", "t2"); // rebuild
+    expect(got).toEqual([{ type: "background_tasks", tasks: [] }]);
+
+    await shutdown(provider);
+  });
+
+  it("announces an empty background set whenever the loop ends — a dead CLI never sends one", async () => {
+    // A crash, a hard abort, backing-session recovery: however the loop ends,
+    // its background tasks die with it.
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+    const run = turn(provider, "sprint: alpha", "t1");
+    openGate(); // the mock stream ends: the loop exits
+    for await (const _ of run.events) { /* drain */ }
+    await Bun.sleep(5);
+    expect(got).toContainEqual({ type: "background_tasks", tasks: [] });
+    await provider.teardown();
+  });
+
+  it("announces an empty background set on a hard abort, even if a new turn rebuilds first", async () => {
+    // The hard abort kills the CLI. Its loop's finally would say so, but a new
+    // turn rebuilding the loop first bumps the generation and silences it.
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+    const run = turn(provider, "sprint: alpha", "t1");
+    sdkInterruptThrows = true;
+    try {
+      await run.interrupt();
+    } finally {
+      sdkInterruptThrows = false;
+    }
+    turn(provider, "sprint: alpha", "t2"); // rebuilds before the old finally runs
+    expect(got).toContainEqual({ type: "background_tasks", tasks: [] });
+    await shutdown(provider);
+  });
+
   it("treats absent and empty appends as the same loop configuration", async () => {
     const provider = makeProvider();
     turn(provider, undefined, "t1");
@@ -1634,6 +1686,39 @@ describe("auto-approved tools still emit tool_start", () => {
     });
   });
 
+  it("attributes a sub-agent's pre-approved call to that sub-agent", async () => {
+    // Without the agent id, a background agent's memory recall between turns
+    // read as the MAIN agent — opening a phantom "continuing" turn and getting
+    // its card cancelled at that turn's exit.
+    const provider = providerWithFleet();
+    capturedQueryOpts = null;
+    sdkMessages = [{ type: "result", subtype: "success", is_error: false, num_turns: 1, result: "ok", modelUsage: {} }];
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => { release = r; });
+
+    const events: ProviderEvent[] = [];
+    const run = provider.runTurn({
+      history: [], userMessage: "hi", workdir: ".",
+      canUseTool: async () => ({ behavior: "allow" as const }),
+    });
+    const drain = (async () => { for await (const e of run.events) events.push(e); })();
+
+    const preToolUse = await firstPreToolUseHook();
+    await preToolUse({
+      hook_event_name: "PreToolUse",
+      tool_name: "mcp__codeoid_fleet__fleet_list",
+      tool_input: {},
+      tool_use_id: "toolu_sub",
+      agent_id: "agent-bg-1",
+    });
+
+    release();
+    sdkGate = null;
+    await drain;
+
+    expect(events.find((e) => e.type === "tool_start")).toMatchObject({ sdkAgentId: "agent-bg-1" });
+  });
+
   it("does NOT emit for a tool that still reaches canUseTool (no double tool_start)", async () => {
     const provider = providerWithFleet();
     capturedQueryOpts = null;
@@ -1761,5 +1846,96 @@ describe("translateSDKMessage — background tasks", () => {
       "claude",
     );
     expect(turnEvents).toEqual([]);
+  });
+});
+
+// A background agent's lifecycle happens on the agent's schedule: its tool
+// calls and results routinely land after turn_done, with no turn queue to take
+// them. Dropped, the tool_start's approval card never rendered and the session
+// blocked on a prompt nobody could see; carried to the next turn, a
+// tool_complete stranded the status. The session channel delivers them now.
+describe("ClaudeProvider — background agent events with no turn in flight", () => {
+  const toolStart: BackgroundLifecycleEvent = {
+    type: "tool_start",
+    toolId: "t1",
+    sdkToolUseId: "u1",
+    sdkAgentId: "agent-1",
+    name: "Bash",
+    input: { command: "ls" },
+    approvalId: "a1",
+  };
+
+  it("routes tool and sub-agent lifecycle events to the session channel", () => {
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    const lifecycle: BackgroundLifecycleEvent[] = [
+      toolStart,
+      { type: "tool_complete", sdkToolUseId: "u1", output: "ok", success: true },
+      { type: "subagent_start", agentId: "agent-2", agentType: "general-purpose" },
+      { type: "subagent_stop", agentId: "agent-2" },
+    ];
+    for (const e of lifecycle) provider._emitForTest(e);
+
+    expect(got).toEqual(lifecycle.map((event) => ({ type: "background_event", event })));
+  });
+
+  it("never opens a turn for a lone turn boundary — a stale turn_done or error would end the next turn", () => {
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    provider._emitForTest({ type: "turn_done", result: { providerId: "claude", model: "m", inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 0 } });
+    provider._emitForTest({ type: "error", message: "late" });
+
+    expect(got).toEqual([]);
+  });
+});
+
+describe("ClaudeProvider — adopting a turn the CLI starts on its own", () => {
+  it("declares that it continues after background work", () => {
+    expect(makeProvider().continuesAfterBackgroundWork).toBe(true);
+  });
+
+  it("opens a turn on the first main-agent event and routes the rest of the turn into it", async () => {
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    provider._emitForTest({ type: "mcp_init", servers: {}, tools: {} });
+    provider._emitForTest({ type: "text_done", content: "The background agent printed BG-DONE.", parentToolUseId: null });
+    provider._emitForTest({ type: "turn_done", result: { providerId: "claude", model: "m", inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 0 } });
+
+    expect(got.map((e) => e.type)).toEqual(["turn_started"]);
+    const run = (got[0] as Extract<SessionScopedEvent, { type: "turn_started" }>).run;
+    const seen: string[] = [];
+    run.endTurn?.();
+    for await (const e of run.events) seen.push(e.type);
+    expect(seen).toEqual(["mcp_init", "text_done", "turn_done"]);
+  });
+
+  it("never opens a turn for a sub-agent's own activity", () => {
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    provider._emitForTest({ type: "text_done", content: "sub-agent's final message", parentToolUseId: "toolu_agent" });
+    provider._emitForTest({ type: "thinking_delta", content: "…", parentToolUseId: "toolu_agent" });
+    provider._emitForTest({ type: "llm_call", usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 }, isPrimary: false });
+
+    expect(got.filter((e) => e.type === "turn_started")).toEqual([]);
+  });
+
+  it("opens a turn for the main agent's tool call, but not a sub-agent's", () => {
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+
+    provider._emitForTest({ type: "tool_start", toolId: "t2", sdkToolUseId: "u2", sdkAgentId: "agent-1", name: "Bash", input: {}, approvalId: "a2" });
+    expect(got.map((e) => e.type)).toEqual(["background_event"]);
+
+    provider._emitForTest({ type: "tool_start", toolId: "t3", sdkToolUseId: "u3", name: "Bash", input: {}, approvalId: "a3" });
+    expect(got.map((e) => e.type)).toEqual(["background_event", "turn_started"]);
   });
 });

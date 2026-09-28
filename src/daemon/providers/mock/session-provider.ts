@@ -114,6 +114,47 @@ export class MockSessionProvider implements SessionProvider {
   /** Times Session called `TurnRun.endTurn()` — the turn-exit signal. */
   endTurnCount = 0;
 
+  /** Models a backend that runs the agent itself when background work settles. */
+  continuesAfterBackgroundWork = false;
+
+  /** Task ids the session asked to stop (`stopBackgroundTasks`). */
+  readonly stoppedTasks: string[] = [];
+
+  async stopBackgroundTasks(taskIds: readonly string[]): Promise<void> {
+    this.stoppedTasks.push(...taskIds);
+  }
+
+  /** Gates the session bound to self-started turns (`TurnRun.bindGate`). */
+  readonly boundGates: Array<Pick<TurnOpts, "canUseTool" | "requestUserInput" | "sender">> = [];
+
+  /**
+   * Start a turn ON THE BACKEND'S OWN, the way the Claude CLI answers a
+   * finished background task: a fresh queue, handed to the session through
+   * `turn_started`, then fed `events`. Returns the queue's push for more.
+   */
+  startOwnTurn(events: ProviderEvent[]): (e: ProviderEvent) => boolean {
+    const queue = new AsyncQueue<ProviderEvent>();
+    this.#currentQueue = queue;
+    const run: TurnRun = {
+      events: queue,
+      interrupt: async () => { queue.close(); },
+      endTurn: () => {
+        this.endTurnCount++;
+        queue.close();
+        if (this.#currentQueue === queue) this.#currentQueue = null;
+      },
+      bindGate: (gate) => { this.boundGates.push(gate); },
+    };
+    if (this.#midTurn) {
+      run.pushMidTurn = (content: string, priority: string) => {
+        this.midTurnPushes.push({ content, priority });
+      };
+    }
+    this.onSessionEvent?.({ type: "turn_started", run });
+    for (const e of events) queue.push(e);
+    return (e) => this.emitLive(e);
+  }
+
   /**
    * Push an event into the LIVE turn queue from a test: the deterministic
    * stand-in for "the SDK emitted this later in the turn". Needed to model a

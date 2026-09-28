@@ -236,3 +236,36 @@ describe("renderSessionBanner", () => {
     expect(out.endsWith("\n")).toBe(true);
   });
 });
+
+// The live TUI renders committed messages through this renderer. It showed the
+// daemon's background wake under "You", in full — a wall of injected digests.
+describe("renderMessage — background wake", () => {
+  const WAKE = [
+    "<background_tasks>",
+    "(daemon-injected background-task notifications — NOT a message from the owner)",
+    "- [completed] task ba3emjr2: Find Studio uses of NEXT_PUBLIC_AUTHN_URL",
+    "- [failed] task a14fac26: # Security review",
+    "  A long digest body that must not be printed inline.",
+    "</background_tasks>",
+    "",
+    "Background work you started earlier has finished.",
+  ].join("\n");
+  const wake = (identity: MessageIdentity) => baseMsg({ role: "user", content: WAKE, identity });
+
+  it("shows the finished tasks compactly, not as the owner's message", () => {
+    const out = stripAnsi(
+      renderMessage(wake({ sub: "system:background", name: "system:background", type: "system" } as MessageIdentity), { cols: 100 }),
+    );
+    expect(out).toContain("Background · 2 tasks finished");
+    expect(out).toContain("completed ba3emjr2  Find Studio uses of NEXT_PUBLIC_AUTHN_URL");
+    expect(out).toContain("failed    a14fac26  # Security review");
+    expect(out).not.toContain("You");
+    expect(out).not.toContain("A long digest body");
+  });
+
+  it("leaves the owner's own message untouched", () => {
+    const out = stripAnsi(renderMessage(wake(USER), { cols: 100 }));
+    expect(out).toContain("You");
+    expect(out).toContain("A long digest body");
+  });
+});

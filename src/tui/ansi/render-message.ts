@@ -28,7 +28,7 @@ import type {
 	ToolInfo,
 	ToolState,
 } from "../../protocol/types.js";
-import { formatCollaborationCost } from "@highflame/codeoid-core";
+import { formatCollaborationCost, isBackgroundWake, parseBackgroundWake } from "@highflame/codeoid-core";
 import { renderMarkdown, type Segment } from "../markdown.js";
 import { computeDiff, truncateToolOutput } from "../diff.js";
 import { fileUri, maybeLink } from "../osc8.js";
@@ -68,6 +68,9 @@ const BODY_INDENT = "  ";
  * 50 in a batch.
  */
 export function renderMessage(msg: SessionMessage, opts: RenderOpts): string {
+	// The daemon's background wake is a user-role turn but not the owner
+	// speaking — a compact list of finished tasks, not a wall of digests.
+	if (isBackgroundWake(msg)) return renderBackgroundWake(msg, opts);
 	switch (msg.role) {
 		case "user":
 			return renderUser(msg, opts);
@@ -132,6 +135,20 @@ export function renderSessionBanner(
 }
 
 // ── Role renderers ──────────────────────────────────────────────────────────
+
+function renderBackgroundWake(msg: SessionMessage, opts: RenderOpts): string {
+	const tasks = parseBackgroundWake(msg.content);
+	const header = `${gray(bold("Background"))}${dim(` · ${tasks.length === 1 ? "1 task" : `${tasks.length} tasks`} finished`)}`;
+	const width = Math.max(20, opts.cols - BODY_INDENT.length);
+	const rows = tasks.map((t) => {
+		const status = t.status === "completed" ? gray(t.status.padEnd(9)) : red(t.status.padEnd(9));
+		const lead = `${t.status.padEnd(9)} ${t.taskId}  `;
+		const room = Math.max(0, width - lead.length);
+		const headline = t.headline.length > room ? `${t.headline.slice(0, Math.max(0, room - 1))}…` : t.headline;
+		return `${BODY_INDENT}${status} ${dim(t.taskId)}  ${headline}`;
+	});
+	return join(["", header, ...rows]);
+}
 
 function renderUser(msg: SessionMessage, opts: RenderOpts): string {
 	const header = cyan(bold("You"));

@@ -45,6 +45,12 @@ export type ToolApprovalFn = (
   approvalId: string,
   toolName: string,
   input: Record<string, unknown>,
+  /**
+   * Fires when the backend abandons the request (e.g. the CLI cancelled the
+   * agent that asked). A pending approval is then withdrawn rather than left
+   * waiting on an answer nobody will read.
+   */
+  signal?: AbortSignal,
 ) => Promise<{
   behavior: "allow" | "deny";
   updatedInput?: Record<string, unknown>;
@@ -285,13 +291,26 @@ export interface BackgroundTaskSnapshot {
  * observed live — a session promised a report, its tasks settled into a closed
  * queue, and it sat idle until the owner interrupted it.
  *
- * Two events, mirroring the level+edge design the Claude SDK itself settled on:
+ * Four events. The first two mirror the level+edge design the Claude SDK
+ * itself settled on:
  *
  * - `background_tasks` is a LEVEL: the full live set after any membership
  *   change, with REPLACE semantics. Consumers swap their state for the payload,
  *   so a missed event can never wedge a stale "running" indicator.
  * - `background_task_settled` is the EDGE that carries the outcome digest —
  *   the thing a session must be woken with.
+ * - `background_event` carries a background agent's own lifecycle — a tool
+ *   call, a tool result, a sub-agent starting or stopping — that happened with
+ *   no turn in flight. Background agents outlive the turn that spawned them,
+ *   so their tool calls (and the approvals those need) routinely land between
+ *   turns; sent to the turn queue they were dropped, the approval card never
+ *   rendered, and the session sat blocked on a prompt nobody could see.
+ * - `turn_started` hands the session a turn the BACKEND started on its own.
+ *   The Claude CLI answers a finished background task by running the main
+ *   agent itself — no prompt from codeoid. With no turn queue open, that whole
+ *   turn (its reply, its tool calls and their approvals, its turn_done) was
+ *   dropped: the owner saw nothing, and an approval inside it wedged the
+ *   session invisibly. The session consumes it like any turn it started.
  *
  * Provider-agnostic on purpose: claude maps its SDK notifications onto these
  * today; pi/gemini/codex emit nothing until their harnesses grow background
@@ -306,7 +325,27 @@ export type SessionScopedEvent =
       status: "completed" | "failed" | "stopped";
       /** Compressed outcome — what the session is woken with. Never a raw transcript. */
       summary: string;
-    };
+    }
+  | { type: "background_event"; event: BackgroundLifecycleEvent }
+  | { type: "turn_started"; run: TurnRun };
+
+/** The provider events a background agent emits on its own, between turns. */
+export type BackgroundLifecycleEvent = Extract<
+  ProviderEvent,
+  { type: "tool_start" | "tool_complete" | "subagent_start" | "subagent_stop" }
+>;
+
+/** Event types a provider reroutes to `background_event` when no turn can take them. */
+export const BACKGROUND_LIFECYCLE_EVENT_TYPES: ReadonlySet<ProviderEvent["type"]> = new Set([
+  "tool_start",
+  "tool_complete",
+  "subagent_start",
+  "subagent_stop",
+]);
+
+export function isBackgroundLifecycleEvent(e: ProviderEvent): e is BackgroundLifecycleEvent {
+  return BACKGROUND_LIFECYCLE_EVENT_TYPES.has(e.type);
+}
 
 // ── TurnRun ───────────────────────────────────────────────────────────────────
 
@@ -334,6 +373,13 @@ export interface TurnRun {
    * must never throw into the consumer's finally.
    */
   endTurn?(): void;
+  /**
+   * Adopted turns only (`turn_started`): bind the approval gate, dialog
+   * handler and acting principal for this turn. A turn the backend started on
+   * its own would otherwise run under the previous prompted turn's gate, and
+   * audit every auto-approval in it to a human who never asked for it.
+   */
+  bindGate?(gate: Pick<TurnOpts, "canUseTool" | "requestUserInput" | "sender">): void;
 }
 
 // ── ModelInfo ─────────────────────────────────────────────────────────────────
@@ -459,6 +505,21 @@ export interface SessionProvider extends AgentProvider {
    * background work simply never call it.
    */
   onSessionEvent?: ((event: SessionScopedEvent) => void) | undefined;
+  /**
+   * The backend continues the conversation by itself when background work it
+   * started settles (delivering the result to the model and running a turn,
+   * surfaced as `turn_started`). The session then waits for that turn instead
+   * of injecting its own wake, which would be a second, duplicate turn — and
+   * wakes itself only as a fallback if no turn begins.
+   */
+  readonly continuesAfterBackgroundWork?: boolean;
+  /**
+   * Stop background tasks by id (the ids of the `background_tasks` level).
+   * What Stop does when no turn is in flight: without it, nobody holding only
+   * `session:interrupt` could halt a misbehaving background agent. Optional —
+   * a backend with no background work never has any to stop.
+   */
+  stopBackgroundTasks?(taskIds: readonly string[]): Promise<void>;
   /** Underlying backing session ID (for display and Store persistence). */
   readonly backingSessionId: string;
   /** True once runTurn() has been called at least once (guards agent registration). */
