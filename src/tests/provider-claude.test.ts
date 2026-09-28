@@ -665,6 +665,13 @@ describe("decodeStderrEntities", () => {
     );
   });
 
+  // `&apos;` is the XML-named form of `&#39;`; not emitted today, but decoding
+  // both keeps a future encoder change from silently reintroducing the mismatch.
+  it("decodes both spellings of the apostrophe", () => {
+    expect(decodeStderrEntities("echo &apos;a&apos;")).toBe("echo 'a'");
+    expect(decodeStderrEntities("echo &#39;a&#39;")).toBe("echo 'a'");
+  });
+
   // `&amp;gt;` is the escaped form of the literal text `&gt;`, not of `>`.
   // Decoding `&amp;` first would collapse it to `>` — over-decoding a command
   // into one that was never declared, i.e. granting the wrong thing.

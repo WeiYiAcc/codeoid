@@ -1608,13 +1608,17 @@ export function skillSandboxDirs(skillsDirs: string[]): string[] {
  * and the two are compared by exact string equality, so decoding here is what
  * makes the approved command equal the declared one (#233). The set is closed
  * and small: `&` is decoded LAST so a doubly-escaped `&amp;gt;` resolves to
- * `&gt;` rather than being decoded twice into `>`.
+ * `&gt;` rather than being decoded twice into `>`. Both spellings of the
+ * apostrophe are handled — `&apos;` is the XML-named form of `&#39;` and is not
+ * emitted today, but decoding it costs nothing and keeps a future encoder
+ * change from silently reintroducing the same mismatch.
  */
 export function decodeStderrEntities(s: string): string {
   return s
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
     .replace(/&#39;/g, "'")
     .replace(/&amp;/g, "&");
 }
